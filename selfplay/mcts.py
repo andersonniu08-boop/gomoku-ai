@@ -1,0 +1,435 @@
+"""AlphaZero-style MCTS with PUCT, driven by a dual-headed CNN."""
+
+from __future__ import annotations
+
+import math
+import random
+from dataclasses import dataclass, field
+from typing import Optional
+
+import torch
+
+from engine.board import Board, Player
+from engine.threats import ThreatDetector, ThreatType
+from neural.wrapper import GomokuInferenceWrapper
+
+# When there are more legal moves than this, keep only the top-N priors
+# to bound the branching factor.
+_POLICY_CUTOFF = 40
+
+
+@dataclass(slots=True)
+class MCTSNode:
+    """Edge statistics for one action leading from a parent state.
+
+    Children are stored directly on this node keyed by ``(row, col)``.
+    """
+
+    prior: float = 0.0
+    visit_count: int = 0
+    total_value: float = 0.0  # sum of backed-up values (negated per level)
+    virtual_loss: int = 0
+    children: dict[tuple[int, int], MCTSNode] = field(default_factory=dict)
+
+    @property
+    def q(self) -> float:
+        """Mean action value Q(s,a) ∈ [-1, 1].
+
+        Virtual loss penalises in-flight nodes: it adds one phantom loss
+        per pending evaluation below this node, steering subsequent
+        PUCT selections toward other branches.
+        """
+        total_n = self.visit_count + self.virtual_loss
+        if total_n == 0:
+            return 0.0
+        return (self.total_value - self.virtual_loss) / total_n
+
+
+@dataclass(slots=True)
+class SearchResult:
+    """Full MCTS search statistics for a root position.
+
+    Attributes:
+        visit_counts:      Number of times each child move was visited.
+        q_values:          Mean action value Q(s,a) for each child move.
+        priors:            Prior probability P(s,a) from the policy head.
+        total_simulations: Total MCTS simulations run (0 if threat-overridden).
+    """
+
+    visit_counts: dict[tuple[int, int], int]
+    q_values: dict[tuple[int, int], float]
+    priors: dict[tuple[int, int], float]
+    total_simulations: int
+
+
+class MCTS:
+    """Monte-Carlo Tree Search powered by a neural value/policy network.
+
+    Uses a single *virtual board* that is mutated during selection and
+    restored during back-propagation, avoiding per-node board copies.
+
+    Parameters:
+        wrapper:           Trained ``GomokuInferenceWrapper``.
+        c_puct:            Exploration constant for the PUCT formula.
+        num_simulations:   MCTS iterations per search.
+        threat_override:   When True, use ``ThreatDetector`` to short-circuit
+                           search on immediate wins / must-block threats.
+        dirichlet_alpha:   Concentration parameter for root Dirichlet noise.
+                           ``None`` (default) = no noise.
+        dirichlet_epsilon: Mixing proportion: ``(1-ε) · prior + ε · noise``.
+    """
+
+    def __init__(
+        self,
+        wrapper: GomokuInferenceWrapper,
+        *,
+        c_puct: float = 2.5,
+        num_simulations: int = 400,
+        batch_size: int = 8,
+        threat_override: bool = True,
+        dirichlet_alpha: Optional[float] = None,
+        dirichlet_epsilon: float = 0.25,
+    ):
+        self.wrapper = wrapper
+        self.c_puct = c_puct
+        self.num_simulations = num_simulations
+        self.batch_size = batch_size
+        self.threat_override = threat_override
+        self.dirichlet_alpha = dirichlet_alpha
+        self.dirichlet_epsilon = dirichlet_epsilon
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def search(self, board: Board) -> dict[tuple[int, int], float]:
+        """Run batched MCTS from *board*.
+
+        Descends *batch_size* leaves in parallel (using virtual loss to
+        diversify paths), evaluates them with one GPU call, then backs up.
+
+        Returns a probability distribution over legal moves.
+        """
+        if board.is_terminal():
+            return {}
+
+        if self.threat_override:
+            forced = self._check_forced(board)
+            if forced is not None:
+                return forced
+
+        sim_board = board.copy()
+        root = MCTSNode()
+        self._run_search(sim_board, root)
+
+        total_visits = sum(c.visit_count for c in root.children.values())
+        if total_visits == 0:
+            legal = board.get_legal_moves()
+            return {m: 1.0 / len(legal) for m in legal}
+        return {m: c.visit_count / total_visits for m, c in root.children.items()}
+
+    def search_with_stats(self, board: Board) -> SearchResult:
+        """Like :meth:`search` but also returns Q-values and priors.
+
+        Uses the same internal search loop as :meth:`search` but exposes
+        root children's full statistics (visit counts, Q values, priors)
+        instead of just visit proportions.
+        """
+        if board.is_terminal():
+            return SearchResult({}, {}, {}, 0)
+
+        if self.threat_override:
+            forced = self._check_forced(board)
+            if forced is not None:
+                moves = list(forced)
+                visit_counts = {m: 1 for m in moves}
+                q_values = {m: 0.0 for m in moves}
+                priors = {m: forced[m] for m in moves}
+                return SearchResult(visit_counts, q_values, priors, 0)
+
+        sim_board = board.copy()
+        root = MCTSNode()
+        self._run_search(sim_board, root)
+
+        visit_counts = {m: c.visit_count for m, c in root.children.items()}
+        q_values = {m: c.q for m, c in root.children.items()}
+        priors = {m: c.prior for m, c in root.children.items()}
+        return SearchResult(visit_counts, q_values, priors, self.num_simulations)
+
+    def select_move(
+        self, board: Board, *, temperature: float = 0.0
+    ) -> tuple[int, int]:
+        """Return the best move after search.
+
+        *temperature=0*  → greedy (most visits).
+        *temperature>0*  → sample proportionally to visit counts.
+        """
+        visit_probs = self.search(board)
+
+        if temperature == 0.0:
+            return max(visit_probs, key=visit_probs.get)
+
+        moves = list(visit_probs)
+        probs = [visit_probs[m] ** (1.0 / temperature) for m in moves]
+        total = sum(probs)
+        probs = [p / total for p in probs]
+        return moves[random.choices(range(len(moves)), weights=probs, k=1)[0]]
+
+    # ------------------------------------------------------------------
+    # Search loop (shared by search() and search_with_stats())
+    # ------------------------------------------------------------------
+
+    def _run_search(self, sim_board: Board, root: MCTSNode) -> None:
+        """Run the main MCTS loop, populating *root* with visited statistics.
+
+        Mutates *sim_board* during descent and restores it after each batch
+        of descents.  *root* is expanded and its children accumulate visit
+        counts, total values, and virtual loss markers.
+
+        Call this from :meth:`search` and :meth:`search_with_stats` after
+        creating a fresh copy of the board and an empty root node.
+        """
+        sims_done = 0
+        while sims_done < self.num_simulations:
+            n = min(self.batch_size, self.num_simulations - sims_done)
+
+            # ---- descend n times, collecting leaves ----
+            paths: list[list[MCTSNode]] = []
+            leaf_boards: list[Board] = []
+            leaf_terminal: list[bool] = []
+
+            for _ in range(n):
+                path, leaf_b, is_term = self._descend_and_tag(sim_board, root)
+                paths.append(path)
+                leaf_boards.append(leaf_b)
+                leaf_terminal.append(is_term)
+                # Rewind sim_board to root.
+                for _ in range(len(path) - 1):
+                    sim_board.undo_move()
+
+            # ---- batch-evaluate non-terminal leaves ----
+            eval_indices = [i for i, t in enumerate(leaf_terminal) if not t]
+            eval_boards = [leaf_boards[i] for i in eval_indices]
+            if eval_boards:
+                batch_results = self.wrapper.batch_evaluate(eval_boards)
+
+            # ---- expand & backup ----
+            result_idx = 0
+            for i in range(n):
+                path = paths[i]
+                leaf_node = path[-1]
+
+                if leaf_terminal[i]:
+                    value = self._terminal_value(leaf_boards[i])
+                else:
+                    move_probs, value = batch_results[result_idx]
+                    result_idx += 1
+                    # Expand leaf with capped, renormalised priors.
+                    if len(move_probs) > _POLICY_CUTOFF:
+                        move_probs.sort(key=lambda x: x[1], reverse=True)
+                        move_probs = move_probs[:_POLICY_CUTOFF]
+                        total = sum(p for _, p in move_probs)
+                        move_probs = [(m, p / total) for m, p in move_probs]
+                    for (r, c), prior in move_probs:
+                        leaf_node.children[(r, c)] = MCTSNode(prior=prior)
+
+                # Backup: walk up, update stats, remove virtual loss.
+                current_value = value
+                for j in range(len(path) - 1, 0, -1):
+                    node = path[j]
+                    node.visit_count += 1
+                    node.total_value += current_value
+                    node.virtual_loss -= 1
+                    current_value = -current_value
+
+            # ---- inject Dirichlet noise at root after first expansion ----
+            if (
+                self.dirichlet_alpha is not None
+                and root.children
+                and sims_done == 0
+            ):
+                self._apply_dirichlet_noise(root)
+
+            sims_done += n
+
+    def select_move(
+        self, board: Board, *, temperature: float = 0.0
+    ) -> tuple[int, int]:
+        """Return the best move after search.
+
+        *temperature=0*  → greedy (most visits).
+        *temperature>0*  → sample proportionally to visit counts.
+        """
+        visit_probs = self.search(board)
+
+        if temperature == 0.0:
+            return max(visit_probs, key=visit_probs.get)
+
+        moves = list(visit_probs)
+        probs = [visit_probs[m] ** (1.0 / temperature) for m in moves]
+        total = sum(probs)
+        probs = [p / total for p in probs]
+        return moves[random.choices(range(len(moves)), weights=probs, k=1)[0]]
+
+    # ------------------------------------------------------------------
+    # Batched descent
+    # ------------------------------------------------------------------
+
+    def _descend_and_tag(
+        self, board: Board, root: MCTSNode
+    ) -> tuple[list[MCTSNode], Board, bool]:
+        """Descend from *root* to a leaf via PUCT, adding virtual loss.
+
+        Mutates *board* as it goes, then copies it at the leaf.
+
+        Returns:
+            path_nodes:  [root, child1, child2, ..., leaf] — every node
+                         except root has had virtual_loss incremented.
+            leaf_board:  A copy of *board* at the leaf.
+            is_terminal: True if the leaf board is terminal.
+        """
+        path_nodes = [root]
+        node = root
+        while node.children:
+            action = self._puct_select(node)
+            board.make_move(*action)
+            node = node.children[action]
+            node.virtual_loss += 1
+            path_nodes.append(node)
+
+        leaf_board = board.copy()
+        is_terminal = board.is_terminal()
+        return path_nodes, leaf_board, is_terminal
+
+    # ------------------------------------------------------------------
+    # PUCT
+    # ------------------------------------------------------------------
+
+    def _puct_select(self, node: MCTSNode) -> tuple[int, int]:
+        """Return the child action that maximises the PUCT score."""
+        best_action = None
+        best_score = -float("inf")
+
+        sqrt_parent_n = math.sqrt(
+            sum(c.visit_count for c in node.children.values()) + 1
+        )
+
+        for action, child in node.children.items():
+            exploit = child.q
+            explore = (
+                self.c_puct
+                * child.prior
+                * sqrt_parent_n
+                / (1 + child.visit_count)
+            )
+            score = exploit + explore
+            if score > best_score:
+                best_score = score
+                best_action = action
+
+        assert best_action is not None
+        return best_action
+
+    # ------------------------------------------------------------------
+    # Threat short-circuit
+    # ------------------------------------------------------------------
+
+    def _check_forced(self, board: Board) -> Optional[dict[tuple[int, int], float]]:
+        """Return a deterministic move distribution when the position contains
+        an immediate win or must-block threat, bypassing MCTS entirely."""
+        threats = ThreatDetector.detect_all(board, board.current_player)
+        opp_threats = ThreatDetector.detect_all(
+            board, Player(-board.current_player)
+        )
+
+        legal = board.get_legal_moves()
+        legal_set = set(legal)
+
+        # 1) Immediate winning moves for the current player — play one.
+        #
+        # FIVE and OPEN_FOUR: every open end and/or gap is a winning move
+        #   (placing there completes five-in-a-row).
+        #
+        # CLOSED_FOUR behaviour depends on the pattern:
+        #   * Contiguous four with one open end (XXXX_): the open end IS a
+        #     winning move — placing there creates five-in-a-row.
+        #   * Split four (XX_XX, XXX_X): the *gap* is a winning move — filling
+        #     it gives five-in-a-row.  The external open ends are NOT winning
+        #     moves because they extend the split pattern without producing
+        #     five consecutive stones.
+        win_moves: set[tuple[int, int]] = set()
+        for t in threats:
+            if t.threat_type == ThreatType.CLOSED_FOUR:
+                if t.gap is not None:
+                    # Split closed four — only the gap creates five-in-a-row.
+                    win_moves.add(t.gap)
+                else:
+                    # Contiguous closed four — the one open end creates five.
+                    for end in t.open_ends:
+                        win_moves.add(end)
+            elif t.threat_type in (ThreatType.FIVE, ThreatType.OPEN_FOUR):
+                for end in t.open_ends:
+                    win_moves.add(end)
+                if t.gap is not None:
+                    win_moves.add(t.gap)
+
+        win_moves &= legal_set
+        if win_moves:
+            return {m: 1.0 / len(win_moves) for m in win_moves}
+
+        # 2) Opponent has an open four — must block.
+        opp_open_fours = [
+            t for t in opp_threats if t.threat_type == ThreatType.OPEN_FOUR
+        ]
+        if opp_open_fours:
+            block_set: set[tuple[int, int]] = set()
+            for t in opp_open_fours:
+                if t.gap is not None:
+                    block_set.add(t.gap)
+                for end in t.open_ends:
+                    block_set.add(end)
+            block_moves = list(block_set & legal_set)
+            if block_moves:
+                return {m: 1.0 / len(block_moves) for m in block_moves}
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _apply_dirichlet_noise(self, root: MCTSNode) -> None:
+        """Mix Dirichlet noise into root children's priors for exploration.
+
+        The mixed prior for each child ``a`` at the root is:
+
+            P'(s, a) = (1 - ε) · P(s, a) + ε · η_a
+
+        where ``η ~ Dir(α)`` is a symmetric Dirichlet sample.  With a
+        small ``α`` (e.g. 0.03) the Dirichlet mass is concentrated on
+        a few entries, encouraging the search to try diverse lines.
+
+        Priors remain normalized after mixing because both components
+        sum to 1 and the convex combination preserves the sum.
+        """
+        if not root.children:
+            return
+
+        moves = list(root.children)
+        k = len(moves)
+        alpha = torch.full((k,), self.dirichlet_alpha)
+        noise = torch.distributions.Dirichlet(alpha).sample().tolist()
+
+        for (r, c), eta in zip(moves, noise):
+            child = root.children[(r, c)]
+            child.prior = (1.0 - self.dirichlet_epsilon) * child.prior + \
+                          self.dirichlet_epsilon * eta
+
+    @staticmethod
+    def _terminal_value(board: Board) -> float:
+        """Value of a terminal state from the perspective of the player who
+        **just moved** (the winner, or 0 for a draw)."""
+        winner = board.check_win()
+        if winner is None:
+            return 0.0  # draw (full board)
+        return 1.0  # the player who just moved won
