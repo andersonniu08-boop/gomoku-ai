@@ -28,6 +28,7 @@ class GomokuInferenceWrapper:
         use_attention: bool = True,
         use_pre_activation: bool = False,
         value_global_pool: bool = True,
+        profiler: Optional[Profiler] = None,
     ):
         if device is None:
             if torch.cuda.is_available():
@@ -37,6 +38,9 @@ class GomokuInferenceWrapper:
             else:
                 device = "cpu"
         self.device = torch.device(device)
+        from selfplay.profiler import Profiler as _Profiler
+        self.profiler: _Profiler = profiler or _Profiler()
+        self.profiler.disable()  # off by default; MCTS enables when needed
 
         self.model = GomokuNet(
             board_size=15,
@@ -108,12 +112,15 @@ class GomokuInferenceWrapper:
             value:      scalar in [-1, 1] — expected outcome for
                         ``board.current_player``.
         """
-        tensor = board_to_tensor(board).to(self.device)
+        with self.profiler.measure("eval.board_to_tensor"):
+            tensor = board_to_tensor(board).to(self.device)
 
-        with torch.no_grad():
-            log_policy, value = self.model(tensor)
+        with self.profiler.measure("eval.model_forward"):
+            with torch.no_grad():
+                log_policy, value = self.model(tensor)
 
-        move_probs = policy_to_move_probs(log_policy, board)
+        with self.profiler.measure("eval.policy_to_move_probs"):
+            move_probs = policy_to_move_probs(log_policy, board)
         value = float(value.item())
 
         return move_probs, value
@@ -142,16 +149,19 @@ class GomokuInferenceWrapper:
         if not boards:
             return []
 
-        tensors = torch.cat([board_to_tensor(b) for b in boards], dim=0).to(
-            self.device
-        )
+        with self.profiler.measure("eval.board_to_tensor"):
+            tensors = torch.cat(
+                [board_to_tensor(b) for b in boards], dim=0
+            ).to(self.device)
 
-        with torch.no_grad():
-            log_policy, value = self.model(tensors)
+        with self.profiler.measure("eval.model_forward"):
+            with torch.no_grad():
+                log_policy, value = self.model(tensors)
 
         results: list[tuple[list[tuple[tuple[int, int], float]], float]] = []
         for i, board in enumerate(boards):
-            move_probs = policy_to_move_probs(log_policy[i : i + 1], board)
+            with self.profiler.measure("eval.policy_to_move_probs"):
+                move_probs = policy_to_move_probs(log_policy[i : i + 1], board)
             results.append((move_probs, float(value[i].item())))
 
         return results
