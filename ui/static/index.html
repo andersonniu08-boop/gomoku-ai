@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Gomoku AI</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div id="app">
+    <header>
+      <h1>Gomoku AI</h1>
+    </header>
+
+    <main>
+      <div id="board-container">
+        <canvas id="board-canvas" width="480" height="480"></canvas>
+        <div id="status-bar">
+          <span id="status-player"></span>
+          <div id="toggle-bar">
+            <button id="toggle-heatmap" class="toggle active">■ Heatmap</button>
+            <button id="toggle-tree" class="toggle active">◨ Search Tree</button>
+            <button id="btn-new-game">New Game</button>
+          </div>
+          <span id="status-info"></span>
+        </div>
+      </div>
+
+      <aside id="search-panel" class="visible">
+        <div id="panel-header">
+          <span>Search Tree</span>
+          <button id="panel-close">✕</button>
+        </div>
+        <div id="panel-subtitle"></div>
+        <div id="panel-list"></div>
+      </aside>
+    </main>
+
+    <div id="thinking" class="hidden">thinking...</div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
