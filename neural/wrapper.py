@@ -68,7 +68,12 @@ class GomokuInferenceWrapper:
     def _winning_moves(
         threats: list, legal_set: set[tuple[int, int]]
     ) -> set[tuple[int, int]]:
-        """Return legal moves that complete a winning threat (FIVE or OPEN_FOUR)."""
+        """Return legal moves that complete a winning threat.
+
+        Handles FIVE, OPEN_FOUR, and CLOSED_FOUR.  For closed fours:
+        * Contiguous (XXXX_): the one open end is a winning move.
+        * Split (XX_XX, XXX_X): only the gap creates five-in-a-row.
+        """
         moves: set[tuple[int, int]] = set()
         for t in threats:
             if t.threat_type == ThreatType.FIVE:
@@ -79,6 +84,14 @@ class GomokuInferenceWrapper:
             elif t.threat_type == ThreatType.OPEN_FOUR:
                 for end in t.open_ends:
                     moves.add(end)
+            elif t.threat_type == ThreatType.CLOSED_FOUR:
+                if t.gap is not None:
+                    # Split closed four — only the gap wins.
+                    moves.add(t.gap)
+                else:
+                    # Contiguous closed four — the one open end wins.
+                    for end in t.open_ends:
+                        moves.add(end)
         return moves & legal_set
 
     @staticmethod

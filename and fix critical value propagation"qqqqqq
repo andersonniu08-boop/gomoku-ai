@@ -1,0 +1,95 @@
+[1mdiff --git a/neural/wrapper.py b/neural/wrapper.py[m
+[1mindex 72325b3..bc4eb5a 100644[m
+[1m--- a/neural/wrapper.py[m
+[1m+++ b/neural/wrapper.py[m
+[36m@@ -68,7 +68,12 @@[m [mclass GomokuInferenceWrapper:[m
+     def _winning_moves([m
+         threats: list, legal_set: set[tuple[int, int]][m
+     ) -> set[tuple[int, int]]:[m
+[31m-        """Return legal moves that complete a winning threat (FIVE or OPEN_FOUR)."""[m
+[32m+[m[32m        """Return legal moves that complete a winning threat.[m
+[32m+[m
+[32m+[m[32m        Handles FIVE, OPEN_FOUR, and CLOSED_FOUR.  For closed fours:[m
+[32m+[m[32m        * Contiguous (XXXX_): the one open end is a winning move.[m
+[32m+[m[32m        * Split (XX_XX, XXX_X): only the gap creates five-in-a-row.[m
+[32m+[m[32m        """[m
+         moves: set[tuple[int, int]] = set()[m
+         for t in threats:[m
+             if t.threat_type == ThreatType.FIVE:[m
+[36m@@ -79,6 +84,14 @@[m [mclass GomokuInferenceWrapper:[m
+             elif t.threat_type == ThreatType.OPEN_FOUR:[m
+                 for end in t.open_ends:[m
+                     moves.add(end)[m
+[32m+[m[32m            elif t.threat_type == ThreatType.CLOSED_FOUR:[m
+[32m+[m[32m                if t.gap is not None:[m
+[32m+[m[32m                    # Split closed four — only the gap wins.[m
+[32m+[m[32m                    moves.add(t.gap)[m
+[32m+[m[32m                else:[m
+[32m+[m[32m                    # Contiguous closed four — the one open end wins.[m
+[32m+[m[32m                    for end in t.open_ends:[m
+[32m+[m[32m                        moves.add(end)[m
+         return moves & legal_set[m
+ [m
+     @staticmethod[m
+[1mdiff --git a/selfplay/evaluator.py b/selfplay/evaluator.py[m
+[1mindex 2268157..bdf63d1 100644[m
+[1m--- a/selfplay/evaluator.py[m
+[1m+++ b/selfplay/evaluator.py[m
+[36m@@ -73,7 +73,8 @@[m [mclass BatchedLeafEvaluator:[m
+         self.device = wrapper.device[m
+         self.target_batch_size = target_batch_size[m
+         self.profiler = profiler or Profiler()[m
+[31m-        self.profiler.disable()  # off by default; MCTS enables when needed[m
+[32m+[m[32m        if profiler is None:[m
+[32m+[m[32m            self.profiler.disable()  # own profiler off by default; shared profiler stays as-is[m
+ [m
+         self._warmup()[m
+ [m
+[1mdiff --git a/selfplay/mcts.py b/selfplay/mcts.py[m
+[1mindex 27f298a..19b62d3 100644[m
+[1m--- a/selfplay/mcts.py[m
+[1m+++ b/selfplay/mcts.py[m
+[36m@@ -110,6 +110,7 @@[m [mclass MCTS:[m
+         self.evaluator = evaluator or BatchedLeafEvaluator([m
+             wrapper,[m
+             target_batch_size=max(32, batch_size),[m
+[32m+[m[32m            profiler=self.profiler,[m
+         )[m
+ [m
+     # ------------------------------------------------------------------[m
+[36m@@ -267,15 +268,28 @@[m [mclass MCTS:[m
+                         else:[m
+                             move_probs, value = batch_results[result_idx][m
+                             result_idx += 1[m
+[31m-                            # Expand leaf with capped, renormalised priors.[m
+[31m-                            with self.profiler.measure("expand.cutoff"):[m
+[32m+[m[32m                            # The evaluator returns value from the leaf board's[m
+[32m+[m[32m                            # current_player perspective, which is the OPPONENT of[m
+[32m+[m[32m                            # the player who made the move to reach this leaf.[m
+[32m+[m[32m                            # Child nodes store Q from the mover's perspective, so[m
+[32m+[m[32m                            # we negate here.  Terminal values from _terminal_value[m
+[32m+[m[32m                            # already use the correct convention (+1 = mover won).[m
+[32m+[m[32m                            value = -value[m
+[32m+[m[32m                            # Expand leaf.  When the branching factor exceeds the[m
+[32m+[m[32m                            # cutoff, use tactical move ordering so critical[m
+[32m+[m[32m                            # moves (wins, blocks) survive pruning.  Common[m
+[32m+[m[32m                            # case (≤ cutoff) is a no-op — neural priors[m
+[32m+[m[32m                            # pass through without board-copy overhead.[m
+[32m+[m[32m                            with self.profiler.measure("expand.order_and_filter"):[m
+                                 if len(move_probs) > _POLICY_CUTOFF:[m
+[31m-                                    move_probs.sort(key=lambda x: x[1], reverse=True)[m
+[31m-                                    move_probs = move_probs[:_POLICY_CUTOFF][m
+[32m+[m[32m                                    move_probs = order_and_filter_moves([m
+[32m+[m[32m                                        leaf_boards[i], move_probs, max_moves=_POLICY_CUTOFF[m
+[32m+[m[32m                                    )[m
+[32m+[m[32m                                else:[m
+[32m+[m[32m                                    # Renormalise — evaluator may return[m
+[32m+[m[32m                                    # probabilities that don't sum exactly to 1.[m
+                                     total = sum(p for _, p in move_probs)[m
+[31m-                                    move_probs = [[m
+[31m-                                        (m, p / total) for m, p in move_probs[m
+[31m-                                    ][m
+[32m+[m[32m                                    move_probs = [(m, p / total) for m, p in move_probs][m
+                             with self.profiler.measure("expand.create_nodes"):[m
+                                 for (r, c), prior in move_probs:[m
+                                     leaf_node.children[(r, c)] = MCTSNode(prior=prior)[m

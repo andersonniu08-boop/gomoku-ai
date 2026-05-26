@@ -73,7 +73,8 @@ class BatchedLeafEvaluator:
         self.device = wrapper.device
         self.target_batch_size = target_batch_size
         self.profiler = profiler or Profiler()
-        self.profiler.disable()  # off by default; MCTS enables when needed
+        if profiler is None:
+            self.profiler.disable()  # own profiler off by default; shared profiler stays as-is
 
         self._warmup()
 
