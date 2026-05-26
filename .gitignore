@@ -32,3 +32,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Brainstorming visual companion cache
+.superpowers/
