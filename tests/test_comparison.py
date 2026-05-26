@@ -23,12 +23,7 @@ def _make_wrapper():
         torch.save(model.state_dict(), f)
         tmp_path = Path(f.name)
 
-    class _CleanupWrapper(GomokuInferenceWrapper):
-        def __del__(self):
-            if tmp_path.exists():
-                tmp_path.unlink()
-
-    wrapper = _CleanupWrapper(tmp_path, device="cpu")
+    wrapper = GomokuInferenceWrapper(tmp_path, device="cpu")
     return wrapper, tmp_path
 
 
@@ -163,7 +158,7 @@ def test_fast_path_structure():
         for c in comp.top_candidates:
             assert c.visit_count == 0
             assert c.q_value == 0.0
-        assert comp.search_stats == {"method": "fast"} or True  # Any dict is fine
+        # Fast path doesn't set search_stats; it's an empty dict.
     finally:
         tmp.unlink()
 

@@ -29,7 +29,7 @@ training) can be studied, replaced, or extended independently.
 3. GPU-batched MCTS inference for faster self-play.
 4. Distributed self-play across multiple processes / machines.
 5. Stronger CNN architectures (SE blocks, attention, deeper resnets).
-6. Explainable AI visualizations (policy heatmaps, value landscapes).
+6. Explainable AI visualizations (policy heatmaps, value landscapes). ✅
 7. Web-based UI with search visualization.
 
 ## Core Architecture Rules
@@ -568,11 +568,11 @@ align with this roadmap.
 - [ ] Stronger architectures: Squeeze-and-Excitation blocks, attention layers,
   deeper residual networks.
 
-### Phase 4 — Explainability
+### Phase 4 — Explainability ✅
 
-- [ ] Saliency maps showing which board regions influenced the network's decision.
-- [ ] Activation visualization for residual blocks.
-- [ ] Comparison tool: human move vs. AI recommended move with explanation.
+- [x] Saliency maps showing which board regions influenced the network's decision.
+- [x] Activation visualization for residual blocks.
+- [x] Comparison tool: human move vs. AI recommended move with explanation.
 
 ### Phase 5 — UI and Visualization
 

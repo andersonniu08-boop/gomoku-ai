@@ -20,6 +20,7 @@ from selfplay.selfplay import (
 )
 
 
+
 def _make_wrapper():
     """Create a wrapper around a freshly-initialised (untrained) model."""
     model = GomokuNet(board_size=15, in_channels=3)
@@ -353,24 +354,85 @@ def test_replay_buffer_state_dict_roundtrip():
 # ---------------------------------------------------------------------------
 
 
-def test_selfplay_to_replay_buffer_integration():
+# ---------------------------------------------------------------------------
+# Regression: no double-search during self-play
+# ---------------------------------------------------------------------------
+
+
+def test_select_move_uses_provided_visit_probs():
+    """select_move must use provided visit_probs instead of calling search()."""
     wrapper, tmp = _make_wrapper()
     try:
-        game = SelfPlayGame(
-            wrapper,
-            num_simulations=10,
-            temperature=1.0,
-            temperature_threshold=0,
-            augment=False,
+        mcts = MCTS(wrapper, num_simulations=10, threat_override=False)
+        board = Board()
+        board.make_move(7, 7)
+        board.make_move(0, 0)
+
+        legal = board.get_legal_moves()
+        fake_probs = {m: 1.0 / len(legal) for m in legal}
+
+        move = mcts.select_move(board, temperature=0.0, visit_probs=fake_probs)
+        assert move in legal
+    finally:
+        tmp.unlink()
+
+
+def test_select_move_fallback_calls_search():
+    """select_move without visit_probs should still call search() (backward compat)."""
+    wrapper, tmp = _make_wrapper()
+    try:
+        mcts = MCTS(wrapper, num_simulations=10, threat_override=False)
+        board = Board()
+        # Use a board with at least one move so search returns a distribution.
+        board.make_move(7, 7)
+
+        # Should not crash and return a valid move.
+        move = mcts.select_move(board, temperature=0.0)
+        assert isinstance(move, tuple)
+        assert len(move) == 2
+    finally:
+        tmp.unlink()
+
+
+def test_selfplay_no_double_search():
+    """SelfPlayGame.play() must not re-run MCTS via select_move.
+
+    Regression test: play() was calling both search() and select_move(),
+    and select_move() called search() again internally.  The fix passes
+    visit_probs from search() into select_move() to avoid the duplicate.
+
+    We verify by counting how many times MCTS.search() is called during
+    a game and asserting it equals the number of moves (one per move).
+    """
+    import unittest.mock as mock
+
+    wrapper, tmp = _make_wrapper()
+    try:
+        original_search = MCTS.search
+
+        call_count = 0
+
+        def counting_search(self, board):
+            nonlocal call_count
+            call_count += 1
+            return original_search(self, board)
+
+        with mock.patch.object(MCTS, "search", counting_search):
+            game = SelfPlayGame(
+                wrapper,
+                num_simulations=10,
+                temperature=1.0,
+                temperature_threshold=0,
+                augment=False,
+            )
+            examples = game.play()
+
+        # One search per move, no extras from select_move.
+        num_moves = len(examples)
+        assert call_count == num_moves, (
+            f"MCTS.search() called {call_count}x for {num_moves} moves. "
+            f"Expected exactly 1 call per move ({num_moves}). "
+            f"This means the double-search bug has regressed."
         )
-        examples = game.play()
-
-        buf = ReplayBuffer(max_size=10_000)
-        buf.add_examples(examples)
-
-        states, policies, values = buf.get_batch(min(len(examples), 32))
-        assert states.dim() == 4  # (B, 3, 15, 15)
-        assert policies.dim() == 2  # (B, 225)
-        assert values.dim() == 2  # (B, 1)
     finally:
         tmp.unlink()

@@ -12,6 +12,9 @@ import torch
 from engine.board import Board, Player
 from engine.threats import ThreatDetector, ThreatType
 from neural.wrapper import GomokuInferenceWrapper
+from selfplay.evaluator import BatchedLeafEvaluator
+from selfplay.move_ordering import order_and_filter_moves
+from selfplay.profiler import Profiler
 
 # When there are more legal moves than this, keep only the top-N priors
 # to bound the branching factor.
@@ -77,6 +80,10 @@ class MCTS:
         dirichlet_alpha:   Concentration parameter for root Dirichlet noise.
                            ``None`` (default) = no noise.
         dirichlet_epsilon: Mixing proportion: ``(1-ε) · prior + ε · noise``.
+        batch_size:        Leaves collected per neural-evaluation batch.
+                           Larger values improve GPU utilisation.
+        evaluator:         Optional ``BatchedLeafEvaluator``.  Created
+                           automatically from *wrapper* when not provided.
     """
 
     def __init__(
@@ -85,10 +92,12 @@ class MCTS:
         *,
         c_puct: float = 2.5,
         num_simulations: int = 400,
-        batch_size: int = 8,
+        batch_size: int = 32,
         threat_override: bool = True,
         dirichlet_alpha: Optional[float] = None,
         dirichlet_epsilon: float = 0.25,
+        profiler: Optional[Profiler] = None,
+        evaluator: Optional[BatchedLeafEvaluator] = None,
     ):
         self.wrapper = wrapper
         self.c_puct = c_puct
@@ -97,6 +106,11 @@ class MCTS:
         self.threat_override = threat_override
         self.dirichlet_alpha = dirichlet_alpha
         self.dirichlet_epsilon = dirichlet_epsilon
+        self.profiler = profiler or Profiler()
+        self.evaluator = evaluator or BatchedLeafEvaluator(
+            wrapper,
+            target_batch_size=max(32, batch_size),
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -113,14 +127,19 @@ class MCTS:
         if board.is_terminal():
             return {}
 
+        # Wire profiler into wrapper so eval timings are unified.
+        self.wrapper.profiler = self.profiler
+
         if self.threat_override:
-            forced = self._check_forced(board)
+            with self.profiler.measure("threat_check"):
+                forced = self._check_forced(board)
             if forced is not None:
                 return forced
 
         sim_board = board.copy()
         root = MCTSNode()
-        self._run_search(sim_board, root)
+        with self.profiler.measure("search.total"):
+            self._run_search(sim_board, root)
 
         total_visits = sum(c.visit_count for c in root.children.values())
         if total_visits == 0:
@@ -138,8 +157,11 @@ class MCTS:
         if board.is_terminal():
             return SearchResult({}, {}, {}, 0)
 
+        self.wrapper.profiler = self.profiler
+
         if self.threat_override:
-            forced = self._check_forced(board)
+            with self.profiler.measure("threat_check"):
+                forced = self._check_forced(board)
             if forced is not None:
                 moves = list(forced)
                 visit_counts = {m: 1 for m in moves}
@@ -149,7 +171,8 @@ class MCTS:
 
         sim_board = board.copy()
         root = MCTSNode()
-        self._run_search(sim_board, root)
+        with self.profiler.measure("search.total"):
+            self._run_search(sim_board, root)
 
         visit_counts = {m: c.visit_count for m, c in root.children.items()}
         q_values = {m: c.q for m, c in root.children.items()}
@@ -157,14 +180,24 @@ class MCTS:
         return SearchResult(visit_counts, q_values, priors, self.num_simulations)
 
     def select_move(
-        self, board: Board, *, temperature: float = 0.0
+        self,
+        board: Board,
+        *,
+        temperature: float = 0.0,
+        visit_probs: Optional[dict[tuple[int, int], float]] = None,
     ) -> tuple[int, int]:
         """Return the best move after search.
+
+        When *visit_probs* is provided the caller has already run
+        :meth:`search` on this *board* and is passing the result in to
+        avoid a redundant second search.  When omitted (default) a fresh
+        search is run.
 
         *temperature=0*  → greedy (most visits).
         *temperature>0*  → sample proportionally to visit counts.
         """
-        visit_probs = self.search(board)
+        if visit_probs is None:
+            visit_probs = self.search(board)
 
         if temperature == 0.0:
             return max(visit_probs, key=visit_probs.get)
@@ -193,83 +226,80 @@ class MCTS:
         while sims_done < self.num_simulations:
             n = min(self.batch_size, self.num_simulations - sims_done)
 
-            # ---- descend n times, collecting leaves ----
-            paths: list[list[MCTSNode]] = []
-            leaf_boards: list[Board] = []
-            leaf_terminal: list[bool] = []
+            with self.profiler.measure("search.batch"):
+                # ---- descend n times, collecting leaves ----
+                with self.profiler.measure("search.descend_batch"):
+                    paths: list[list[MCTSNode]] = []
+                    leaf_boards: list[Board] = []
+                    leaf_terminal: list[bool] = []
 
-            for _ in range(n):
-                path, leaf_b, is_term = self._descend_and_tag(sim_board, root)
-                paths.append(path)
-                leaf_boards.append(leaf_b)
-                leaf_terminal.append(is_term)
-                # Rewind sim_board to root.
-                for _ in range(len(path) - 1):
-                    sim_board.undo_move()
+                    for _ in range(n):
+                        with self.profiler.measure("descend.single"):
+                            path, leaf_b, is_term = self._descend_and_tag(
+                                sim_board, root
+                            )
+                        paths.append(path)
+                        leaf_boards.append(leaf_b)
+                        leaf_terminal.append(is_term)
+                        # Rewind sim_board to root.
+                        with self.profiler.measure("descend.rewind"):
+                            for _ in range(len(path) - 1):
+                                sim_board.undo_move()
 
-            # ---- batch-evaluate non-terminal leaves ----
-            eval_indices = [i for i, t in enumerate(leaf_terminal) if not t]
-            eval_boards = [leaf_boards[i] for i in eval_indices]
-            if eval_boards:
-                batch_results = self.wrapper.batch_evaluate(eval_boards)
+                # ---- batch-evaluate non-terminal leaves ----
+                with self.profiler.measure("search.neural_eval"):
+                    eval_indices = [i for i, t in enumerate(leaf_terminal) if not t]
+                    eval_boards = [leaf_boards[i] for i in eval_indices]
+                    if eval_boards:
+                        batch_results = self.evaluator.evaluate(eval_boards)
+                    else:
+                        batch_results = []
 
-            # ---- expand & backup ----
-            result_idx = 0
-            for i in range(n):
-                path = paths[i]
-                leaf_node = path[-1]
+                # ---- expand & backup ----
+                with self.profiler.measure("search.expand_backup"):
+                    result_idx = 0
+                    for i in range(n):
+                        path = paths[i]
+                        leaf_node = path[-1]
 
-                if leaf_terminal[i]:
-                    value = self._terminal_value(leaf_boards[i])
-                else:
-                    move_probs, value = batch_results[result_idx]
-                    result_idx += 1
-                    # Expand leaf with capped, renormalised priors.
-                    if len(move_probs) > _POLICY_CUTOFF:
-                        move_probs.sort(key=lambda x: x[1], reverse=True)
-                        move_probs = move_probs[:_POLICY_CUTOFF]
-                        total = sum(p for _, p in move_probs)
-                        move_probs = [(m, p / total) for m, p in move_probs]
-                    for (r, c), prior in move_probs:
-                        leaf_node.children[(r, c)] = MCTSNode(prior=prior)
+                        if leaf_terminal[i]:
+                            value = self._terminal_value(leaf_boards[i])
+                        else:
+                            move_probs, value = batch_results[result_idx]
+                            result_idx += 1
+                            # Expand leaf with capped, renormalised priors.
+                            with self.profiler.measure("expand.cutoff"):
+                                if len(move_probs) > _POLICY_CUTOFF:
+                                    move_probs.sort(key=lambda x: x[1], reverse=True)
+                                    move_probs = move_probs[:_POLICY_CUTOFF]
+                                    total = sum(p for _, p in move_probs)
+                                    move_probs = [
+                                        (m, p / total) for m, p in move_probs
+                                    ]
+                            with self.profiler.measure("expand.create_nodes"):
+                                for (r, c), prior in move_probs:
+                                    leaf_node.children[(r, c)] = MCTSNode(prior=prior)
 
-                # Backup: walk up, update stats, remove virtual loss.
-                current_value = value
-                for j in range(len(path) - 1, 0, -1):
-                    node = path[j]
-                    node.visit_count += 1
-                    node.total_value += current_value
-                    node.virtual_loss -= 1
-                    current_value = -current_value
+                        # Backup: walk up, update stats, remove virtual loss.
+                        with self.profiler.measure("backup.walk"):
+                            current_value = value
+                            for j in range(len(path) - 1, 0, -1):
+                                node = path[j]
+                                node.visit_count += 1
+                                node.total_value += current_value
+                                node.virtual_loss -= 1
+                                current_value = -current_value
 
-            # ---- inject Dirichlet noise at root after first expansion ----
-            if (
-                self.dirichlet_alpha is not None
-                and root.children
-                and sims_done == 0
-            ):
-                self._apply_dirichlet_noise(root)
+                # ---- inject Dirichlet noise at root after first expansion ----
+                if (
+                    self.dirichlet_alpha is not None
+                    and root.children
+                    and sims_done == 0
+                ):
+                    with self.profiler.measure("dirichlet_noise"):
+                        self._apply_dirichlet_noise(root)
 
-            sims_done += n
-
-    def select_move(
-        self, board: Board, *, temperature: float = 0.0
-    ) -> tuple[int, int]:
-        """Return the best move after search.
-
-        *temperature=0*  → greedy (most visits).
-        *temperature>0*  → sample proportionally to visit counts.
-        """
-        visit_probs = self.search(board)
-
-        if temperature == 0.0:
-            return max(visit_probs, key=visit_probs.get)
-
-        moves = list(visit_probs)
-        probs = [visit_probs[m] ** (1.0 / temperature) for m in moves]
-        total = sum(probs)
-        probs = [p / total for p in probs]
-        return moves[random.choices(range(len(moves)), weights=probs, k=1)[0]]
+                sims_done += n
 
     # ------------------------------------------------------------------
     # Batched descent
@@ -291,14 +321,18 @@ class MCTS:
         path_nodes = [root]
         node = root
         while node.children:
-            action = self._puct_select(node)
-            board.make_move(*action)
+            with self.profiler.measure("descend.puct_select"):
+                action = self._puct_select(node)
+            with self.profiler.measure("descend.make_move"):
+                board.make_move(*action)
             node = node.children[action]
             node.virtual_loss += 1
             path_nodes.append(node)
 
-        leaf_board = board.copy()
-        is_terminal = board.is_terminal()
+        with self.profiler.measure("descend.board_copy"):
+            leaf_board = board.copy()
+        with self.profiler.measure("descend.is_terminal"):
+            is_terminal = board.is_terminal()
         return path_nodes, leaf_board, is_terminal
 
     # ------------------------------------------------------------------

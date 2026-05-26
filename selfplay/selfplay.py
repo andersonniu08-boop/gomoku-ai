@@ -185,7 +185,7 @@ class SelfPlayGame:
             # sign once the game concludes.
             raw.append((state, policy, board.current_player))
 
-            move = mcts.select_move(board, temperature=temp)
+            move = mcts.select_move(board, temperature=temp, visit_probs=visit_probs)
             board.make_move(*move)
 
         # Phase 2 — convert to (state, policy, value_target)

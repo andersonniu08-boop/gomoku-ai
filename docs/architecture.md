@@ -27,13 +27,21 @@ gomoku-ai/
 │   ├── replay_buffer.py            #   ReplayBuffer — FIFO storage, batch sampling
 │   └── train.py                    #   compute_loss, run_evaluation, main() loop
 │
-├── tests/                          # 84 tests across 6 files
+├── explain/                         # Explainability layer (Phase 4)
+│   ├── saliency.py                  #   Integrated Gradients / vanilla gradient attribution
+│   ├── activations.py               #   Residual block forward-hook activation capture
+│   └── comparison.py                #   Human vs AI move comparison with MCTS statistics
+│
+├── tests/                           # 105 tests across 9 files
 │   ├── test_encoding.py            #   7 tests
-│   ├── test_mcts.py                #   7 tests
+│   ├── test_mcts.py                #   18 tests
 │   ├── test_neural.py              #   6 tests
 │   ├── test_selfplay.py            #   30 tests
 │   ├── test_threats.py             #   25 tests
-│   └── test_train.py               #   9 tests
+│   ├── test_train.py               #   9 tests
+│   ├── test_saliency.py            #   29 tests
+│   ├── test_activations.py         #   13 tests
+│   └── test_comparison.py          #   24 tests
 │
 ├── checkpoints/                    # Model weight files (gitignored)
 │   ├── best.pt                     #   Strongest model — used for self-play
@@ -56,8 +64,10 @@ Imports flow strictly downward. Higher layers may import from lower layers;
 lower layers must **never** import from higher layers.
 
 ```
-selfplay/     ──┐
-                │  may import from engine/ and neural/
+explain/      ──┐
+                │  may import from selfplay/, neural/, and engine/
+selfplay/     ──┤
+                │  may import from neural/ and engine/
 neural/       ──┤
                 │  may import from engine/
 engine/       ──┘
@@ -132,7 +142,9 @@ no UI or API dependencies.
 | File | Class/Function | Responsibility |
 |------|---------------|----------------|
 | `mcts.py` | `MCTSNode` | Edge statistics: prior, visit_count, total_value, children, Q(s,a) |
-| | `MCTS` | PUCT search, `search(board)` → visit distribution, `select_move(board, temp)` |
+| | `MCTS` | PUCT search, `search(board)` → visit distribution, `select_move(board, temp)`. Uses `BatchedLeafEvaluator` for GPU-efficient leaf evaluation. |
+| `evaluator.py` | `EvaluationResult` | (move_probs, value) named tuple returned by leaf evaluation |
+| | `BatchedLeafEvaluator` | Optimized batched neural evaluation: pre-allocated tensor array, single `.tolist()` sync, on-device policy softmax, CUDA warmup |
 | `selfplay.py` | `TrainingExample` | (state (3,15,15), policy (225,), value float) |
 | | `SelfPlayGame` | Plays one game: MCTS per move, records training triples, temperature annealing |
 | | `SYMMETRIES` / `augment_examples()` | D₄ dihedral group: 8 rotations/reflections applied to states and policies |
@@ -143,6 +155,27 @@ no UI or API dependencies.
 | | `_play_eval_game()` | One deterministic game between two different wrappers |
 | | `run_evaluation()` | 100-game match, alternating colors, returns new model win rate |
 | | `main()` | Two-phase training loop orchestrator |
+
+#### `explain/` — Explainability (Phase 4)
+
+May import from `selfplay/`, `neural/`, and `engine/`. Read-only consumers of
+model outputs and MCTS statistics. Produces structured data (dataclass instances,
+NumPy arrays) with no UI dependencies — ready for Phase 5 rendering.
+
+| File | Class/Function | Responsibility |
+|------|---------------|----------------|
+| `saliency.py` | `SaliencyMap` | 15×15 attribution heatmap in [0, 1] |
+| | `compute_saliency()` | Integrated Gradients or vanilla gradient attribution |
+| | `attribution_to_grid()` | (3, 15, 15) gradient → (15, 15) single-channel heatmap |
+| `activations.py` | `ActivationSnapshot` | Captured feature maps per residual block |
+| | `ActivationCapture` | Context manager for safe forward hook lifecycle |
+| | `capture_activations()` | High-level: board → forward pass → snapshot |
+| | `select_top_channels()` | Top-k channels by L2 activation norm |
+| | `channel_to_grid()` | Extract single channel as 15×15 grid |
+| `comparison.py` | `MoveCandidate` | Single move statistics: prior, visits, Q, is_human_move |
+| | `MoveComparison` | Full comparison: top-k candidates, human rank, values before/after |
+| | `compare_move()` | MCTS-powered comparison pipeline |
+| | `compare_move_fast()` | Policy-head-only fast path |
 
 ## Data Flow
 
@@ -221,6 +254,63 @@ Board ──▶ board_to_tensor() ──▶ GomokuNet.forward() ──▶ (log_p
 │  exists, skip neural evaluation entirely         │
 └──────────────────────────────────────────────────┘
 ```
+## Batched Neural Evaluation
+
+The `BatchedLeafEvaluator` (`selfplay/evaluator.py`) replaces direct
+`wrapper.batch_evaluate()` calls in the MCTS loop.  It provides three
+optimisations over the naive per-board evaluation path:
+
+### 1. Batch tensor construction
+
+Instead of converting each board independently (numpy → torch → unsqueeze → cat → device),
+the evaluator pre-allocates a single `(B, 3, 15, 15)` float32 NumPy array and fills
+each board's channels via boolean indexing into the board grid.  One `torch.from_numpy()`
+and one `.to(device)` suffices for the entire batch.
+
+### 2. Batched post-processing
+
+- **Values**: extracted with a single `.tolist()` call — one CPU–GPU synchronisation
+  instead of one per board.
+- **Policies**: `torch.exp()` computed on-device, transferred to CPU in one `.cpu().numpy()`
+  call, then per-board legal-move filtering in NumPy.
+
+### 3. CUDA kernel warmup
+
+A dummy forward pass at construction time initialises CuDNN heuristics and kernel
+launch infrastructure so the first real batch does not pay cold-start latency.
+
+### Architecture tradeoffs
+
+| Decision | Rationale |
+|----------|-----------|
+| Larger batch size (default 32, was 8) | Underutilised GPU on small batches was the primary bottleneck.  Batch=32 exercises GPU compute units substantially better while adding only moderate virtual-loss pressure. |
+| Synchronous evaluation (no async accumulation) | Async accumulation across MCTS iterations would change search semantics.  Current design keeps zero-overhead semantics: MCTS descends, evaluates, backs up — no pending evaluations. |
+| Parallel descent via virtual loss | Virtual loss (1 per in-flight path) steers descents toward diverse branches naturally as batch size grows.  With batch ≤ 128 the distortion is negligible. |
+| Per-board legal-move filtering on CPU | Legal moves are board-structure-dependent; filtering in NumPy after the GPU transfer is simpler and fast enough (~0.01 ms per board). |
+
+### Remaining bottlenecks (post-batching)
+
+1. **Board copying during descent** — each leaf requires a full `Board.copy()` call.
+   For batch_size=32 this is 32 copies per iteration.  A copy-on-write or
+   reference-counted board state would reduce overhead but adds complexity.
+
+2. **Serial undo rewinding** — after each descent, the virtual board is rewound
+   move-by-move.  This is O(depth) per descent and grows with search depth.
+   A board state stack (push/pop) would be O(1).
+
+3. **Python overhead in the hot loop** — the inner MCTS loop makes many Python-level
+   calls (`_puct_select`, `make_move`, `undo_move`).  These are individually fast but
+   cumulatively significant at 400+ simulations.
+
+### Future scaling opportunities
+
+- **CUDA graphs**: capture the forward pass as a CUDA graph for zero-overhead kernel launch.
+  Particularly beneficial once batch sizes stabilise.
+- **Torch compile**: `torch.compile` the model forward pass for fused kernel execution.
+- **Multi-stream evaluation**: overlap data transfer (H2D) with MCTS descent using
+  CUDA streams (advanced, adds complexity).
+- **Dynamic batching**: if self-play produces many terminal leaves (few non-terminal
+  evaluations per batch), pad or reschedule to maintain batch utilisation.
 
 ## Key Design Decisions
 
@@ -276,12 +366,15 @@ Value backup negates at each level (win for opponent = loss for current player).
 | File | Tests | Focus |
 |------|-------|-------|
 | `test_encoding.py` | 7 | board_to_tensor, policy_to_move_probs |
-| `test_mcts.py` | 7 | search distribution, move selection, win/block detection |
+| `test_mcts.py` | 18 | search distribution, move selection, win/block detection, search_with_stats |
 | `test_neural.py` | 6 | model output shapes, value range, forward pass |
 | `test_selfplay.py` | 30 | symmetries, TrainingExample, SelfPlayGame, ReplayBuffer |
 | `test_threats.py` | 25 | threat types, detection, edge cases, scoring |
 | `test_train.py` | 9 | loss functions, checkpoint roundtrip, training, eval, integration |
-| **Total** | **84** | |
+| `test_saliency.py` | 29 | completeness axiom, shapes, ranges, methods, targets, symmetry, IG quality |
+| `test_activations.py` | 13 | hook lifecycle, shapes, cleanup, channel selection, idempotency |
+| `test_comparison.py` | 24 | move ranking, values, serialization, edge cases, threat override |
+| **Total** | **161** | |
 
 ## Roadmap
 
@@ -291,21 +384,23 @@ Value backup negates at each level (win for opponent = loss for current player).
 - [x] `selfplay/train.py` — training loop with loss computation and checkpointing
 - [x] Model evaluation — pit new model vs best model
 
-### Phase 2 — Performance
-- [ ] Batched neural inference for multiple MCTS leaf evaluations
-- [ ] GPU-accelerated MCTS
-- [ ] Virtual loss for parallel MCTS within a single search
-- [ ] Profile and optimize hot path
+### Phase 2 — Performance ✅
+- [x] Batched neural inference for multiple MCTS leaf evaluations
+- [x] GPU-accelerated MCTS (batch evaluation on GPU)
+- [x] Virtual loss for parallel MCTS within a single search
+- [x] Profile and optimize hot path (Profiler, optimized tensor pipeline)
+- [ ] CUDA graphs for zero-overhead model invocation
+- [ ] `torch.compile` for fused kernel execution
 
 ### Phase 3 — Scaling
 - [ ] Distributed self-play (multiple workers, central trainer)
 - [ ] Stronger architectures (SE blocks, attention, deeper resnets)
 - [ ] Support for larger board sizes
 
-### Phase 4 — Explainability
-- [ ] Saliency maps
-- [ ] Activation visualization
-- [ ] Human vs AI move comparison tool
+### Phase 4 — Explainability ✅
+- [x] Saliency maps
+- [x] Activation visualization
+- [x] Human vs AI move comparison tool
 
 ### Phase 5 — UI and Visualization
 - [ ] Web-based game UI

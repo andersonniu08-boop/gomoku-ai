@@ -113,15 +113,19 @@ def train_on_examples(
     batch_size: int,
     scheduler: Optional[CosineAnnealingLR] = None,
     device: Optional[str] = None,
-) -> float:
+) -> dict[str, float]:
     """Train the model for one pass over *examples*.
 
-    Examples are shuffled before batching.  Returns the average loss.
+    Examples are shuffled before batching.  Returns a dict with keys
+    ``loss``, ``policy_loss``, ``value_loss``, and ``entropy``.
     """
     random.shuffle(examples)
     model.train()
 
     total_loss = 0.0
+    total_policy = 0.0
+    total_value = 0.0
+    total_entropy = 0.0
     num_batches = 0
 
     for i in range(0, len(examples), batch_size):
@@ -138,18 +142,33 @@ def train_on_examples(
             target_values = target_values.to(device)
 
         log_policy, value = model(states)
-        _, _, loss = compute_loss(log_policy, value, target_policies, target_values)
+        policy_loss, value_loss, total = compute_loss(
+            log_policy, value, target_policies, target_values
+        )
+
+        # Policy entropy: H(P) = -sum(P * log P)
+        probs = torch.exp(log_policy)
+        entropy = -(probs * log_policy).sum(dim=1).mean()
 
         optimizer.zero_grad()
-        loss.backward()
+        total.backward()
         optimizer.step()
         if scheduler is not None:
             scheduler.step()
 
-        total_loss += loss.item()
+        total_loss += total.item()
+        total_policy += policy_loss.item()
+        total_value += value_loss.item()
+        total_entropy += entropy.item()
         num_batches += 1
 
-    return total_loss / max(num_batches, 1)
+    n = max(num_batches, 1)
+    return {
+        "loss": total_loss / n,
+        "policy_loss": total_policy / n,
+        "value_loss": total_value / n,
+        "entropy": total_entropy / n,
+    }
 
 
 def _play_eval_game(
@@ -278,38 +297,38 @@ def main(
     scheduler = CosineAnnealingLR(optimizer, T_max=num_iterations * batches_per_iter)
 
     for iteration in range(1, num_iterations + 1):
+        iter_start = time.monotonic()
+
         # --- Phase A: Collect self-play data ---
-        # 1. Ingest any worker-generated files.
+        # 1. Ingest any worker-generated files (bonus data from distributed
+        #    workers, if any are running).
         ingested = ingest_game_files(buffer, game_dir, consumed_dir)
         if ingested > 0:
             print(f"\nIteration {iteration}: Ingested {ingested} game files, "
                   f"buffer now {len(buffer)}")
 
-        # 2. Fallback: generate local games if workers haven't produced enough.
-        if len(buffer) < batch_size:
-            print(f"  Buffer too small ({len(buffer)} < {batch_size}), "
-                  f"generating {games_per_iteration} local games...")
-            wrapper = GomokuInferenceWrapper(latest_path, device=device)
-            game_runner = SelfPlayGame(
-                wrapper,
-                num_simulations=mcts_simulations,
-                temperature=selfplay_temperature,
-                temperature_threshold=selfplay_temp_threshold,
-                threat_override=True,
-                augment=True,
-            )
+        # 2. Generate fresh self-play games with the LATEST model every
+        #    iteration.  This is the core of AlphaZero policy iteration:
+        #    improved model → improved search → improved policy targets.
+        wrapper = GomokuInferenceWrapper(latest_path, device=device)
+        game_runner = SelfPlayGame(
+            wrapper,
+            num_simulations=mcts_simulations,
+            temperature=selfplay_temperature,
+            temperature_threshold=selfplay_temp_threshold,
+            threat_override=True,
+            augment=True,
+        )
 
-            for _ in range(games_per_iteration):
-                examples = game_runner.play()
-                buffer.add_examples(examples)
+        for _ in range(games_per_iteration):
+            examples = game_runner.play()
+            buffer.add_examples(examples)
 
-            torch.save(buffer.state_dict(), str(buffer_path))
-            print(f"  Buffer now {len(buffer)} after local generation")
-            # Use the locally-generated examples for training.
-            train_examples = buffer.sample(min(len(buffer), batch_size * 10))
-        else:
-            # Buffer is healthy — sample from it.
-            train_examples = buffer.sample(min(len(buffer), batch_size * 10))
+        torch.save(buffer.state_dict(), str(buffer_path))
+
+        # 3. Sample a training batch from the full replay buffer.
+        #    Mixes fresh examples with older ones from previous iterations.
+        train_examples = buffer.sample(min(len(buffer), batch_size * 10))
 
         # --- Phase B: Train ---
         # Reload latest weights into the persistent model so optimizer
@@ -319,14 +338,21 @@ def main(
         )
         model.load_state_dict(state_dict)
 
-        avg_loss = train_on_examples(
+        metrics = train_on_examples(
             model, optimizer, train_examples, batch_size, scheduler, device=device
         )
 
         save_model_checkpoint(model, latest_path)
         torch.save(buffer.state_dict(), str(buffer_path))
-        print(f"  Training loss: {avg_loss:.4f}  "
-              f"(lr={scheduler.get_last_lr()[0]:.6f})")
+
+        elapsed = time.monotonic() - iter_start
+        print(f"  loss={metrics['loss']:.4f}  "
+              f"policy={metrics['policy_loss']:.4f}  "
+              f"value={metrics['value_loss']:.4f}  "
+              f"entropy={metrics['entropy']:.4f}  "
+              f"lr={scheduler.get_last_lr()[0]:.6f}  "
+              f"buffer={len(buffer)}  "
+              f"t={elapsed:.1f}s")
 
         # --- Evaluation ---
         if iteration % eval_frequency == 0:

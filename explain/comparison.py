@@ -8,8 +8,7 @@ after the move.
 
 from __future__ import annotations
 
-from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 from engine.board import Board, Player
@@ -310,7 +309,12 @@ def compare_move(
             else:
                 value_after = -1.0
         else:
-            _, value_after = wrapper.evaluate(board_copy)
+            _, v_raw = wrapper.evaluate(board_copy)
+            # evaluate() returns value from board_copy.current_player's
+            # perspective, which is the opponent after make_move().
+            # Negate so value_after is from the same perspective as
+            # value_before (the human player).
+            value_after = -v_raw
 
     return MoveComparison(
         board=board,
