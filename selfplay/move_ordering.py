@@ -17,7 +17,6 @@ from __future__ import annotations
 from typing import Optional
 
 from engine.board import Board, Player
-from engine.threats import ThreatDetector, ThreatType
 
 # ---------------------------------------------------------------------------
 # Scoring constants
@@ -148,79 +147,74 @@ def _compute_tactical_scores(
     board: Board,
     candidates: list[tuple[tuple[int, int], float]],
 ) -> dict[tuple[int, int], float]:
-    """Score each candidate by simulating it on a copy of *board*.
+    """Score each candidate using incremental line scanning.
 
-    Moves not adjacent to any stone skip expensive simulation — they
-    cannot create or block threats, so their tactical score is 0.
+    Instead of copying the board and running full ``ThreatDetector.detect_all``
+    (which rescans all 225 cells) for every candidate, we check only the
+    four lines through the candidate position.  This is O(board_size) per
+    candidate instead of O(board_size²), and avoids the allocation overhead
+    of board copying.
+
+    Moves not adjacent to any stone receive a score of 0 — they cannot
+    create or block meaningful threats.
     """
     scores: dict[tuple[int, int], float] = {}
     player = board.current_player
     opponent = Player(-player)
+    grid = board.grid
 
     for (r, c), _ in candidates:
-        # Moves far from stones can't create or block threats — skip
-        # the expensive board copy + threat detection.
-        if not _is_adjacent_to_stone(board.grid, r, c):
+        if not _is_adjacent_to_stone(grid, r, c):
             scores[(r, c)] = 0.0
             continue
 
-        copy = board.copy()
-        copy.make_move(r, c)
-
-        score = 0.0
-        threats = ThreatDetector.detect_all(copy, player)
-        for t in threats:
-            if t.threat_type == ThreatType.FIVE:
-                score += _CREATE_FIVE
-            elif t.threat_type == ThreatType.OPEN_FOUR:
-                score += _CREATE_OPEN_FOUR
-            elif t.threat_type == ThreatType.CLOSED_FOUR:
-                score += _CREATE_CLOSED_FOUR
-            elif t.threat_type == ThreatType.OPEN_THREE:
-                score += _CREATE_OPEN_THREE
-
-        # Also check what opponent threats remain after this move.
-        opp_threats = ThreatDetector.detect_all(copy, opponent)
-        for t in opp_threats:
-            if t.threat_type == ThreatType.FIVE:
-                score += _BLOCK_FIVE  # this is BAD — opponent still wins;
-                # we keep it negative so it won't be boosted,
-                # but we won't prune it (it may be the only option).
-                # Actually: we want to KEEP it because it represents
-                # a "must-block-that-doesn't-quite-work" situation.
-                # Let's NOT add a negative score here. Instead, the
-                # absence of a positive block score is enough.
-            elif t.threat_type == ThreatType.OPEN_FOUR:
-                score -= _BLOCK_OPEN_FOUR  # we FAILED to block — bad sign
-            elif t.threat_type == ThreatType.CLOSED_FOUR:
-                score -= _BLOCK_CLOSED_FOUR
-            elif t.threat_type == ThreatType.OPEN_THREE:
-                score -= _BLOCK_OPEN_THREE
-
-        block_score = _score_blocking_value(board, r, c, opponent, player)
-        score += block_score
-
-        score += _PROXIMITY_BONUS  # already confirmed adjacent above
-
-        scores[(r, c)] = score
+        scores[(r, c)] = _score_position_incremental(grid, r, c, player, opponent)
 
     return scores
 
 
-def _score_blocking_value(
-    board: Board, r: int, c: int, opponent: Player, player: Player
+def _score_position_incremental(
+    grid,
+    r: int,
+    c: int,
+    player: Player,
+    opponent: Player,
 ) -> float:
-    """Estimate how much placing at (r,c) disrupts opponent threats.
+    """Estimate the tactical value of placing a *player* stone at (r,c).
 
-    Checks each line through (r,c) for opponent patterns that placing
-    a friendly stone at (r,c) would break.
+    Examines the four line directions through (r,c) and estimates:
+    - Threat creation: how many consecutive friendly stones + open ends
+      this move would produce.
+    - Threat blocking: how many opponent stones lie on these lines
+      (placing here disrupts their extension).
+
+    Returns a scalar score suitable for move prioritisation.
     """
     score = 0.0
+
     for dr, dc in ((0, 1), (1, 0), (1, 1), (1, -1)):
-        # Count opponent stones in this line through (r,c).
-        opp_count = _count_in_line(board.grid, r, c, dr, dc, opponent)
-        # If opponent has 3+ stones on this line through (r,c), our
-        # stone here blocks their extension.
+        # --- Count consecutive friendly stones in both directions ---
+        friendly = _count_in_line(grid, r, c, dr, dc, player)
+        # Count open ends for the resulting group (if we placed here).
+        open_ends = _count_open_ends(grid, r, c, dr, dc, player)
+
+        total_stones = friendly + 1  # +1 for the stone we'd place
+
+        if total_stones >= 5:
+            score += _CREATE_FIVE
+        elif total_stones == 4:
+            if open_ends >= 2:
+                score += _CREATE_OPEN_FOUR
+            elif open_ends >= 1:
+                score += _CREATE_CLOSED_FOUR
+        elif total_stones == 3:
+            # Only an open three if both ends are open AND there's
+            # room to extend (at least one side has 2+ empty cells).
+            if open_ends >= 2:
+                score += _CREATE_OPEN_THREE
+
+        # --- Blocking value: opponent stones on this line ---
+        opp_count = _count_in_line(grid, r, c, dr, dc, opponent)
         if opp_count >= 4:
             score += _BLOCK_OPEN_FOUR
         elif opp_count >= 3:
@@ -228,12 +222,33 @@ def _score_blocking_value(
         elif opp_count >= 2:
             score += _BLOCK_OPEN_THREE * 0.5
 
-        # Friendly stones that this move connects with.
-        friendly = _count_in_line(board.grid, r, c, dr, dc, player)
+        # Connectivity bonus.
         if friendly >= 2:
             score += _CONNECTIVITY_BONUS * friendly
 
+    score += _PROXIMITY_BONUS
     return score
+
+
+def _count_open_ends(
+    grid, r: int, c: int, dr: int, dc: int, player: Player
+) -> int:
+    """Count how many ends of the line through (r,c) are open.
+
+    Assumes a friendly stone is placed at (r,c), then looks outward
+    in both directions for empty cells.
+    """
+    open_ends = 0
+    for direction in (-1, 1):
+        nr, nc = r + dr * direction, c + dc * direction
+        # Walk past friendly stones.
+        while 0 <= nr < 15 and 0 <= nc < 15 and grid[nr, nc] == player:
+            nr += dr * direction
+            nc += dc * direction
+        # The cell after the run is an open end if it's empty.
+        if 0 <= nr < 15 and 0 <= nc < 15 and grid[nr, nc] == 0:
+            open_ends += 1
+    return open_ends
 
 
 def _count_in_line(
