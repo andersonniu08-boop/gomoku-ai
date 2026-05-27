@@ -40,14 +40,17 @@ def test_empty_input_returns_empty():
     assert result == []
 
 
-def test_keeps_all_moves_when_under_max():
-    """When there are fewer moves than max_moves, all should be kept."""
+def test_respects_max_moves():
+    """When legal moves exceed max_moves, output should be capped."""
     board = Board()
     board.make_move(7, 7)
     board.make_move(8, 8)
     probs = _uniform_probs(board)
-    result = order_and_filter_moves(board, probs, max_moves=50)
-    assert len(result) == len(probs)
+    result = order_and_filter_moves(board, probs, max_moves=40)
+    assert len(result) <= 40
+    legal = set(board.get_legal_moves())
+    for m, _ in result:
+        assert m in legal
 
 
 def test_output_is_normalized():
@@ -269,16 +272,15 @@ def test_compute_scores_blocking_move():
 
 
 def test_no_tactical_moves_on_scattered_board():
-    """With scattered stones and no threats, all moves should survive but
-    with moderate scores."""
+    """With scattered stones and no threats, output should be capped to
+    max_moves and normalized."""
     board = Board()
     board.make_move(3, 3)
     board.make_move(10, 10)
     board.make_move(7, 7)
     probs = _uniform_probs(board)
     result = order_and_filter_moves(board, probs, max_moves=40)
-    # All moves should still be in the result (fewer than max_moves)
-    assert len(result) == len(probs)
+    assert len(result) <= 40
     total = sum(p for _, p in result)
     assert abs(total - 1.0) < 1e-5
 
@@ -312,12 +314,8 @@ def test_threat_boost_disabled():
     ])
     probs = _uniform_probs(board)
     result = order_and_filter_moves(board, probs, max_moves=40, threat_boost=False)
-    # Without boost, should still return valid distribution
     total = sum(p for _, p in result)
     assert abs(total - 1.0) < 1e-5
-    # All legal moves should be present (fewer than max_moves)
-    legal = board.get_legal_moves()
-    assert len(result) == len(legal)
     # Without boost, all priors should be equal (uniform input)
     priors = [p for _, p in result]
     assert all(abs(p - priors[0]) < 1e-5 for p in priors)

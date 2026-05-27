@@ -433,30 +433,34 @@ def test_batch_evaluate_with_threats_immediate_win():
 
 
 def test_batch_evaluate_with_threats_block_boosting():
-    """When the opponent has an OPEN_FOUR, blocking moves get boosted."""
+    """Blocking moves get boosted via the urgent_blocks path.
+
+    Uses opponent OPEN_THREE (not OPEN_FOUR) so the hard-override
+    ``must_block`` path is NOT triggered — only ``boosted_blocks``.
+    """
     wrapper = next(_make_wrapper())
     board = Board()
-    # White sets up an OPEN_FOUR while Black plays dummies.
+    # White builds an open-three while Black plays scattered dummies
+    # that form no threat of their own.
     board.make_move(0, 0)  # Black
     board.make_move(7, 3)  # White
-    board.make_move(0, 1)  # Black
+    board.make_move(2, 2)  # Black
     board.make_move(7, 4)  # White
-    board.make_move(0, 2)  # Black
+    board.make_move(0, 4)  # Black
     board.make_move(7, 5)  # White
-    board.make_move(0, 3)  # Black
-    board.make_move(7, 6)  # White
+    board.make_move(2, 6)  # Black
+    board.make_move(6, 6)  # White — second threat pattern
 
-    # Now it's Black's turn. White has OPEN_FOUR — Black must block.
+    # Black's turn. White has open-three at (7,3)-(7,5).
+    # TacticalSolver populates urgent_blocks → boosted_blocks kicks in.
     results = wrapper.batch_evaluate_with_threats([board])
     probs, value, info = results[0]
 
     assert info is not None
     assert info["reason"] == "boosted_blocks"
     assert -1.0 <= value <= 1.0
-    # Distribution is valid.
     total = sum(p for _, p in probs)
     assert abs(total - 1.0) < 1e-5
-    # Block moves are present in the distribution.
-    block_moves = {(7, 2), (7, 7)}
+    block_moves = {(7, 2), (7, 6), (5, 6), (7, 6)}
     for m in block_moves:
         assert m in dict(probs)

@@ -148,12 +148,22 @@ def _compute_tactical_scores(
     board: Board,
     candidates: list[tuple[tuple[int, int], float]],
 ) -> dict[tuple[int, int], float]:
-    """Score each candidate by simulating it on a copy of *board*."""
+    """Score each candidate by simulating it on a copy of *board*.
+
+    Moves not adjacent to any stone skip expensive simulation — they
+    cannot create or block threats, so their tactical score is 0.
+    """
     scores: dict[tuple[int, int], float] = {}
     player = board.current_player
     opponent = Player(-player)
 
     for (r, c), _ in candidates:
+        # Moves far from stones can't create or block threats — skip
+        # the expensive board copy + threat detection.
+        if not _is_adjacent_to_stone(board.grid, r, c):
+            scores[(r, c)] = 0.0
+            continue
+
         copy = board.copy()
         copy.make_move(r, c)
 
@@ -187,15 +197,10 @@ def _compute_tactical_scores(
             elif t.threat_type == ThreatType.OPEN_THREE:
                 score -= _BLOCK_OPEN_THREE
 
-        # If this move blocks an opponent threat, reward it.
-        # Compare: how many threats does the opponent have BEFORE vs AFTER?
-        # For efficiency, just check what threats pass through (r,c).
         block_score = _score_blocking_value(board, r, c, opponent, player)
         score += block_score
 
-        # Positional bonus: proximity to stones
-        if _is_adjacent_to_stone(board.grid, r, c):
-            score += _PROXIMITY_BONUS
+        score += _PROXIMITY_BONUS  # already confirmed adjacent above
 
         scores[(r, c)] = score
 

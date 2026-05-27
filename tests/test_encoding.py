@@ -57,6 +57,7 @@ def test_policy_to_move_probs_normalizes():
     board = Board()
     log_policy = torch.zeros(1, 225).log_softmax(dim=1)  # uniform
     probs = policy_to_move_probs(log_policy, board)
-    assert len(probs) == 1  # only center is legal on empty board
-    assert probs[0][0] == (7, 7)
-    assert abs(probs[0][1] - 1.0) < 1e-6
+    assert len(probs) == 225  # all positions legal on empty board
+    total = sum(p for _, p in probs)
+    assert abs(total - 1.0) < 1e-6
+    assert all(abs(p - 1.0 / 225) < 1e-6 for _, p in probs)

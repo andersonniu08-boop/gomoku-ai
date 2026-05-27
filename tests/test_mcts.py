@@ -331,3 +331,45 @@ def test_search_batch_larger_than_simulations():
         assert abs(total - 1.0) < 1e-5
     finally:
         tmp.unlink()
+
+
+# ---------------------------------------------------------------------------
+# Regression: all empty squares are legal for MCTS
+# ---------------------------------------------------------------------------
+
+
+def test_mcts_accepts_non_adjacent_root_move():
+    """MCTS must consider moves far from existing stones at the root."""
+    wrapper, tmp = _make_wrapper()
+    try:
+        mcts = MCTS(wrapper, num_simulations=20, threat_override=False)
+        board = Board()
+        board.make_move(7, 7)
+        board.make_move(8, 8)
+
+        visit_probs = mcts.search(board)
+        assert len(visit_probs) > 0
+        total = sum(visit_probs.values())
+        assert abs(total - 1.0) < 1e-5
+        legal = set(board.get_legal_moves())
+        for move in visit_probs:
+            assert move in legal, f"MCTS returned illegal move {move}"
+    finally:
+        tmp.unlink()
+
+
+def test_mcts_threat_override_with_full_legality():
+    """Threat override must work correctly when all empty positions are legal."""
+    wrapper, tmp = _make_wrapper()
+    try:
+        mcts = MCTS(wrapper, num_simulations=10, threat_override=True)
+        board = Board()
+        white_cols = [0, 2, 4, 6]
+        for r, c in [(7, 2), (7, 3), (7, 4), (7, 5)]:
+            board.make_move(r, c)
+            board.make_move(8, white_cols.pop(0))
+
+        dist = mcts.search(board)
+        assert set(dist.keys()) == {(7, 1), (7, 6)}
+    finally:
+        tmp.unlink()
