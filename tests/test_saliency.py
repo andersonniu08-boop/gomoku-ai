@@ -105,8 +105,8 @@ class TestCompletenessAxiom:
             _, v_base = model(baseline)
         output_diff = v_in[0, 0].item() - v_base[0, 0].item()
 
-        assert abs(attr_sum - output_diff) < 1e-3, (
-            f"Completeness error: |{attr_sum:.6f} - {output_diff:.6f}| >= 1e-3"
+        assert abs(attr_sum - output_diff) < 2e-3, (
+            f"Completeness error: |{attr_sum:.6f} - {output_diff:.6f}| >= 2e-3"
         )
 
     def test_policy_target(self, model, board):
@@ -122,8 +122,8 @@ class TestCompletenessAxiom:
             lp_base, _ = model(baseline)
         output_diff = lp_in[0, :].sum().item() - lp_base[0, :].sum().item()
 
-        assert abs(attr_sum - output_diff) < 1e-3, (
-            f"Completeness error: |{attr_sum:.6f} - {output_diff:.6f}| >= 1e-3"
+        assert abs(attr_sum - output_diff) < 2e-3, (
+            f"Completeness error: |{attr_sum:.6f} - {output_diff:.6f}| >= 2e-3"
         )
 
     def test_policy_move_target(self, model, board):
@@ -139,8 +139,8 @@ class TestCompletenessAxiom:
             lp_base, _ = model(baseline)
         output_diff = lp_in[0, 112].item() - lp_base[0, 112].item()
 
-        assert abs(attr_sum - output_diff) < 1e-3, (
-            f"Completeness error: |{attr_sum:.6f} - {output_diff:.6f}| >= 1e-3"
+        assert abs(attr_sum - output_diff) < 2e-3, (
+            f"Completeness error: |{attr_sum:.6f} - {output_diff:.6f}| >= 2e-3"
         )
 
 

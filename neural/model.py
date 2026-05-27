@@ -27,6 +27,33 @@ class SELayer(nn.Module):
         return x * y.view(b, c, 1, 1)
 
 
+class SpatialAttention(nn.Module):
+    """CBAM-style spatial attention gate.
+
+    Computes a 2D attention map by pooling across channels (avg + max),
+    convolving the stacked (2, H, W) descriptor with a small kernel, and
+    applying sigmoid.  The resulting (1, H, W) map is broadcast-multiplied
+    with the input to suppress irrelevant spatial regions.
+
+    Applied after SE channel gating and before the residual addition,
+    giving the block a lightweight "where to attend" signal that
+    complements the channel-wise "what to attend" from SE.
+    """
+
+    def __init__(self, kernel_size: int = 3):
+        super().__init__()
+        self.conv = nn.Conv2d(
+            2, 1, kernel_size, padding=kernel_size // 2, bias=False
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        avg = x.mean(dim=1, keepdim=True)       # (B, 1, H, W)
+        mx = x.max(dim=1, keepdim=True)[0]      # (B, 1, H, W)
+        pooled = torch.cat([avg, mx], dim=1)    # (B, 2, H, W)
+        attn = torch.sigmoid(self.conv(pooled)) # (B, 1, H, W)
+        return x * attn
+
+
 class AttentionAugmentedConv(nn.Module):
     """Lightweight multi-head self-attention over the spatial grid.
 
@@ -69,12 +96,17 @@ class AttentionAugmentedConv(nn.Module):
 
 
 class SEResidualBlock(nn.Module):
-    """Residual block with optional SE channel attention and attention-augmented conv.
+    """Residual block with optional SE, spatial attention, and self-attention.
 
     Conv path:      Conv3×3 → BN → ReLU → Conv3×3 → BN
     Attention path: self-attention over spatial grid on input (optional)
     SE:             channel gating after conv+attention merge (optional)
+    Spatial:        CBAM spatial attention after SE (optional)
     Skip:           input added to merged result, then ReLU
+
+    Dilation support expands the receptive field in later blocks
+    without increasing parameter count — critical for detecting
+    long-range five-in-a-row patterns on a 15×15 board.
     """
 
     def __init__(
@@ -82,22 +114,33 @@ class SEResidualBlock(nn.Module):
         channels: int,
         use_se: bool = True,
         use_attention: bool = True,
+        use_spatial: bool = True,
         se_reduction: int = 16,
         num_attention_heads: int = 1,
+        dilation: int = 1,
     ):
         super().__init__()
         self.use_se = use_se
         self.use_attention = use_attention
+        self.use_spatial = use_spatial
 
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.conv1 = nn.Conv2d(
+            channels, channels, kernel_size=3, padding=dilation,
+            dilation=dilation, bias=False,
+        )
         self.bn1 = nn.BatchNorm2d(channels)
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.conv2 = nn.Conv2d(
+            channels, channels, kernel_size=3, padding=dilation,
+            dilation=dilation, bias=False,
+        )
         self.bn2 = nn.BatchNorm2d(channels)
 
         if use_se:
             self.se = SELayer(channels, reduction=se_reduction)
         if use_attention:
             self.attn = AttentionAugmentedConv(channels, num_heads=num_attention_heads)
+        if use_spatial:
+            self.spatial = SpatialAttention(kernel_size=3)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
@@ -111,14 +154,18 @@ class SEResidualBlock(nn.Module):
         if self.use_se:
             out = self.se(out)
 
+        if self.use_spatial:
+            out = self.spatial(out)
+
         out = out + residual
         return F.relu(out)
 
 
 class PreActSEResidualBlock(nn.Module):
-    """Pre-activation (ResNet-v2) residual block with optional SE and attention.
+    """Pre-activation (ResNet-v2) residual block with optional SE, spatial,
+    and self-attention.
 
-    BN → ReLU → Conv3×3 → BN → ReLU → Conv3×3 → (+ Attn) → (SE) → + skip
+    BN → ReLU → Conv3×3 → BN → ReLU → Conv3×3 → (+ Attn) → (SE) → (Spatial) → + skip
 
     Pre-activation places BN → ReLU before convolutions rather than after,
     improving gradient flow for deeper networks (He et al., 2016).
@@ -129,22 +176,33 @@ class PreActSEResidualBlock(nn.Module):
         channels: int,
         use_se: bool = True,
         use_attention: bool = True,
+        use_spatial: bool = True,
         se_reduction: int = 16,
         num_attention_heads: int = 1,
+        dilation: int = 1,
     ):
         super().__init__()
         self.use_se = use_se
         self.use_attention = use_attention
+        self.use_spatial = use_spatial
 
         self.bn1 = nn.BatchNorm2d(channels)
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.conv1 = nn.Conv2d(
+            channels, channels, kernel_size=3, padding=dilation,
+            dilation=dilation, bias=False,
+        )
         self.bn2 = nn.BatchNorm2d(channels)
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.conv2 = nn.Conv2d(
+            channels, channels, kernel_size=3, padding=dilation,
+            dilation=dilation, bias=False,
+        )
 
         if use_se:
             self.se = SELayer(channels, reduction=se_reduction)
         if use_attention:
             self.attn = AttentionAugmentedConv(channels, num_heads=num_attention_heads)
+        if use_spatial:
+            self.spatial = SpatialAttention(kernel_size=3)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
@@ -160,15 +218,24 @@ class PreActSEResidualBlock(nn.Module):
         if self.use_se:
             out = self.se(out)
 
+        if self.use_spatial:
+            out = self.spatial(out)
+
         return out + residual  # no final ReLU — absorbed by next block's BN → ReLU
 
 
 class ResidualBlock(nn.Module):
-    def __init__(self, channels: int):
+    def __init__(self, channels: int, dilation: int = 1):
         super().__init__()
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.conv1 = nn.Conv2d(
+            channels, channels, kernel_size=3, padding=dilation,
+            dilation=dilation, bias=False,
+        )
         self.bn1 = nn.BatchNorm2d(channels)
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.conv2 = nn.Conv2d(
+            channels, channels, kernel_size=3, padding=dilation,
+            dilation=dilation, bias=False,
+        )
         self.bn2 = nn.BatchNorm2d(channels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -184,6 +251,20 @@ class GomokuNet(nn.Module):
 
     Policy head  → log-softmax over 225 cells.
     Value head   → tanh  scalar in [-1, 1].
+
+    Architecture highlights:
+
+    * **Multi-head self-attention** (default 2 heads) complements local
+      convolutions with global pairwise position interactions, helping
+      detect disjoint threats across the board.
+    * **Dilated convolutions** in later residual blocks expand the
+      receptive field without extra parameters, critical for spotting
+      five-in-a-row patterns that span 5+ cells.
+    * **CBAM spatial attention** after SE channel gating gives each
+      block a lightweight "where" signal alongside the "what" signal.
+    * **Deeper policy head** with a 3×3 convolution stage before the
+      1×1 projection gives the policy sufficient capacity to transform
+      shared features into move-specific evidence.
     """
 
     def __init__(
@@ -197,11 +278,29 @@ class GomokuNet(nn.Module):
         use_pre_activation: bool = False,
         value_global_pool: bool = True,
         se_reduction: int = 16,
-        num_attention_heads: int = 1,
+        num_attention_heads: int = 2,
+        use_spatial: bool = True,
+        dilations: list[int] | None = None,
+        policy_hidden_channels: int = 32,
     ):
         super().__init__()
         self.board_size = board_size
         action_space = board_size * board_size  # 225
+
+        # --- dilation schedule ---
+        if dilations is None:
+            # First ~70 % of blocks at dilation 1 (local pattern
+            # refinement), remaining blocks at dilation 2 (long-range
+            # line detection).  For the default 10 blocks this gives
+            # [1,1,1,1,1,1,1, 2,2,2].
+            n_late = max(0, num_res_blocks - 7)
+            dilations = [1] * (num_res_blocks - n_late) + [2] * n_late
+
+        if len(dilations) != num_res_blocks:
+            raise ValueError(
+                f"dilations length ({len(dilations)}) must match "
+                f"num_res_blocks ({num_res_blocks})"
+            )
 
         block_cls = (
             PreActSEResidualBlock if use_pre_activation else SEResidualBlock
@@ -217,16 +316,27 @@ class GomokuNet(nn.Module):
                     num_hidden_channels,
                     use_se=use_se,
                     use_attention=use_attention,
+                    use_spatial=use_spatial,
                     se_reduction=se_reduction,
                     num_attention_heads=num_attention_heads,
+                    dilation=dilations[i],
                 )
-                for _ in range(num_res_blocks)
+                for i in range(num_res_blocks)
             ]
         )
 
-        # --- Policy head ---
-        self.policy_conv = nn.Conv2d(num_hidden_channels, 2, kernel_size=1, bias=False)
-        self.policy_bn = nn.BatchNorm2d(2)
+        # --- Policy head (deeper) ---
+        # 3×3 conv → BN → ReLU  extracts local move-relevant features
+        # 1×1 conv → BN → ReLU  compresses to 2 channels for the FC layer
+        self.policy_conv1 = nn.Conv2d(
+            num_hidden_channels, policy_hidden_channels, kernel_size=3,
+            padding=1, bias=False,
+        )
+        self.policy_bn1 = nn.BatchNorm2d(policy_hidden_channels)
+        self.policy_conv2 = nn.Conv2d(
+            policy_hidden_channels, 2, kernel_size=1, bias=False,
+        )
+        self.policy_bn2 = nn.BatchNorm2d(2)
         self.policy_fc = nn.Linear(2 * board_size * board_size, action_space)
 
         # --- Value head ---
@@ -244,8 +354,9 @@ class GomokuNet(nn.Module):
         for block in self.res_blocks:
             x = block(x)
 
-        # Policy: log-softmax
-        p = F.relu(self.policy_bn(self.policy_conv(x)))
+        # Policy: 3×3 → BN → ReLU → 1×1 → BN → ReLU → FC → log-softmax
+        p = F.relu(self.policy_bn1(self.policy_conv1(x)))
+        p = F.relu(self.policy_bn2(self.policy_conv2(p)))
         p = p.view(p.size(0), -1)
         log_policy = F.log_softmax(self.policy_fc(p), dim=1)
 
