@@ -9,7 +9,7 @@ import torch
 
 from engine.board import Board, Player
 from engine.encoding import board_to_tensor, policy_to_move_probs
-from engine.threats import ThreatDetector, ThreatType
+from engine.tactical import TacticalSolver
 from neural.model import GomokuNet
 
 
@@ -60,59 +60,10 @@ class GomokuInferenceWrapper:
         self.model.eval()
 
     # ------------------------------------------------------------------
-    # Shared threat helpers used by evaluate_with_threats and
-    # batch_evaluate_with_threats.
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _winning_moves(
-        threats: list, legal_set: set[tuple[int, int]]
-    ) -> set[tuple[int, int]]:
-        """Return legal moves that complete a winning threat.
-
-        Handles FIVE, OPEN_FOUR, and CLOSED_FOUR.  For closed fours:
-        * Contiguous (XXXX_): the one open end is a winning move.
-        * Split (XX_XX, XXX_X): only the gap creates five-in-a-row.
-        """
-        moves: set[tuple[int, int]] = set()
-        for t in threats:
-            if t.threat_type == ThreatType.FIVE:
-                if t.gap is not None:
-                    moves.add(t.gap)
-                for end in t.open_ends:
-                    moves.add(end)
-            elif t.threat_type == ThreatType.OPEN_FOUR:
-                for end in t.open_ends:
-                    moves.add(end)
-            elif t.threat_type == ThreatType.CLOSED_FOUR:
-                if t.gap is not None:
-                    # Split closed four — only the gap wins.
-                    moves.add(t.gap)
-                else:
-                    # Contiguous closed four — the one open end wins.
-                    for end in t.open_ends:
-                        moves.add(end)
-        return moves & legal_set
-
-    @staticmethod
-    def _block_moves(
-        opp_threats: list, legal_set: set[tuple[int, int]]
-    ) -> set[tuple[int, int]]:
-        """Return legal moves that block opponent OPEN_FOUR threats."""
-        moves: set[tuple[int, int]] = set()
-        for t in opp_threats:
-            if t.threat_type == ThreatType.OPEN_FOUR:
-                if t.gap is not None:
-                    moves.add(t.gap)
-                for end in t.open_ends:
-                    moves.add(end)
-        return moves & legal_set
-
-    _BLOCK_BOOST_FACTOR = 5.0
-
-    # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    _BLOCK_BOOST_FACTOR = 5.0
 
     def evaluate(
         self, board: Board
@@ -193,26 +144,29 @@ class GomokuInferenceWrapper:
             and ``"reason"``.
         """
         legal = board.get_legal_moves()
-        legal_set = set(legal)
-
-        our_threats = ThreatDetector.detect_all(board, board.current_player)
 
         if hard_override:
-            winning_moves = self._winning_moves(our_threats, legal_set)
-            if winning_moves:
+            analysis = TacticalSolver.analyze(board)
+            forced = analysis.get_forced_distribution()
+            if forced is not None:
                 probs = [
-                    (m, 1.0 / len(winning_moves) if m in winning_moves else 0.0)
+                    (m, forced.get(m, 0.0))
                     for m in legal
                 ]
-                return probs, 1.0, {"overridden": True, "reason": "immediate_win"}
+                reason = "immediate_win" if analysis.winning_moves else \
+                         "must_block" if analysis.must_block else \
+                         "double_threat" if analysis.double_threat_moves else \
+                         "forced_sequence"
+                return probs, 1.0, {"overridden": True, "reason": reason}
 
         move_probs, value = self.evaluate(board)
 
-        opp_threats = ThreatDetector.detect_all(board, Player(-board.current_player))
-        block_set = self._block_moves(opp_threats, legal_set)
-        if block_set:
+        # Boost blocking moves using tactical analysis.
+        analysis = TacticalSolver.analyze(board)
+        urgent = analysis.must_block | analysis.urgent_blocks
+        if urgent:
             move_probs = [
-                (m, p * self._BLOCK_BOOST_FACTOR if m in block_set else p)
+                (m, p * self._BLOCK_BOOST_FACTOR if m in urgent else p)
                 for m, p in move_probs
             ]
             total = sum(p for _, p in move_probs)
@@ -251,37 +205,37 @@ class GomokuInferenceWrapper:
 
         neural_indices: list[int] = []
         neural_boards: list[Board] = []
-        # Cache per-board legal sets and opp threats for the fill-in pass.
-        per_board: list[
-            tuple[list[tuple[int, int]], set[tuple[int, int]]] | None
-        ] = []
+        per_board_urgent: list[set[tuple[int, int]] | None] = []
 
         for i, board in enumerate(boards):
             legal = board.get_legal_moves()
-            legal_set = set(legal)
-
-            our_threats = ThreatDetector.detect_all(board, board.current_player)
-            opp_threats = ThreatDetector.detect_all(
-                board, Player(-board.current_player)
-            )
 
             if hard_override:
-                winning_moves = self._winning_moves(our_threats, legal_set)
-                if winning_moves:
+                analysis = TacticalSolver.analyze(board)
+                forced = analysis.get_forced_distribution()
+                if forced is not None:
                     probs = [
-                        (m, 1.0 / len(winning_moves) if m in winning_moves else 0.0)
+                        (m, forced.get(m, 0.0))
                         for m in legal
                     ]
+                    reason = "immediate_win" if analysis.winning_moves else \
+                             "must_block" if analysis.must_block else \
+                             "double_threat" if analysis.double_threat_moves else \
+                             "forced_sequence"
                     results.append(
-                        (probs, 1.0, {"overridden": True, "reason": "immediate_win"})
+                        (probs, 1.0, {"overridden": True, "reason": reason})
                     )
-                    per_board.append(None)
+                    per_board_urgent.append(None)
                     continue
+
+                urgent = analysis.must_block | analysis.urgent_blocks
+            else:
+                urgent = set()
 
             neural_indices.append(i)
             neural_boards.append(board)
             results.append(([], 0.0, None))  # placeholder
-            per_board.append((legal, opp_threats))
+            per_board_urgent.append(urgent)
 
         if neural_boards:
             neural_results = self.batch_evaluate(neural_boards)
@@ -290,14 +244,10 @@ class GomokuInferenceWrapper:
 
         for j, (i, board) in enumerate(zip(neural_indices, neural_boards)):
             move_probs, value = neural_results[j]
-            legal, opp_threats = per_board[
-                i
-            ]  # per_board[i] is always non-None when i in neural_indices
-
-            block_set = self._block_moves(opp_threats, set(legal))
-            if block_set:
+            urgent = per_board_urgent[i]
+            if urgent:
                 move_probs = [
-                    (m, p * self._BLOCK_BOOST_FACTOR if m in block_set else p)
+                    (m, p * self._BLOCK_BOOST_FACTOR if m in urgent else p)
                     for m, p in move_probs
                 ]
                 total = sum(p for _, p in move_probs)

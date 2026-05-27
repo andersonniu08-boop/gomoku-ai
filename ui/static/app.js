@@ -19,13 +19,21 @@ const searchPanel = document.getElementById('search-panel');
 const panelList = document.getElementById('panel-list');
 const panelSubtitle = document.getElementById('panel-subtitle');
 
+const sideBlackBtn = document.getElementById('btn-side-black');
+const sideWhiteBtn = document.getElementById('btn-side-white');
+const strengthFastBtn = document.getElementById('btn-strength-fast');
+const strengthMedBtn = document.getElementById('btn-strength-medium');
+const strengthStrongBtn = document.getElementById('btn-strength-strong');
+
 // State
 let state = null;
+let humanPlayer = 1;    // 1 = Black, -1 = White — synced from server
+let currentStrength = 'medium';
 let heatmapOn = true;
 let treeOn = true;
 let thinking = false;
 
-// Star points for 15×15 board (positions 3, 7, 11 in both axes)
+// Star points for 15x15 board (positions 3, 7, 11 in both axes)
 const STAR_POINTS = [
   [3,3], [3,7], [3,11],
   [7,3], [7,7], [7,11],
@@ -182,17 +190,35 @@ function updateSearchPanel(result, aiMove) {
 // ─── Status bar ───
 
 function updateStatus(state) {
-  const playerName = state.current_player === 1 ? 'Black' : 'White';
-  statusPlayer.textContent = `● ${playerName}'s turn`;
+  const youLabel = humanPlayer === 1 ? 'Black' : 'White';
+
   if (state.winner !== null) {
-    const winnerName = state.winner === 1 ? 'Black' : 'White';
-    statusPlayer.textContent = `🏆 ${winnerName} wins!`;
+    const winnerLabel = state.winner === humanPlayer ? 'You' : 'AI';
+    statusPlayer.textContent = `${winnerLabel} wins! (${state.winner === 1 ? 'Black' : 'White'})`;
+  } else {
+    statusPlayer.textContent = `Your turn ● ${youLabel}`;
   }
+
   const moveCount = state.board.flat().filter(v => v !== 0).length;
-  statusInfo.textContent = `Move #${Math.ceil(moveCount / 2)}`;
-  if (state.search && state.search.total_simulations) {
-    statusInfo.textContent += ` · ${state.search.total_simulations} sims`;
-  }
+  const sims = state.simulations || 0;
+  statusInfo.textContent = `You: ${youLabel} · Move #${Math.ceil(moveCount / 2)} · ${sims} sims`;
+}
+
+// ─── Side & strength selection ───
+
+function selectSide(side) {
+  sideBlackBtn.classList.toggle('active', side === 'black');
+  sideWhiteBtn.classList.toggle('active', side === 'white');
+  startNewGame(side, currentStrength);
+}
+
+function selectStrength(strength) {
+  strengthFastBtn.classList.toggle('active', strength === 'fast');
+  strengthMedBtn.classList.toggle('active', strength === 'medium');
+  strengthStrongBtn.classList.toggle('active', strength === 'strong');
+  currentStrength = strength;
+  // A strength change applies on next new game — no instant restart.
+  updateStatus(state);
 }
 
 // ─── API calls ───
@@ -200,11 +226,19 @@ function updateStatus(state) {
 async function makeMove(r, c) {
   if (thinking) return;
 
+  // Show thinking overlay for the REAL duration of the search.
+  thinking = true;
+  thinkingEl.classList.remove('hidden');
+
   const resp = await fetch('/api/search', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ move: [r, c] }),
   });
+
+  thinkingEl.classList.add('hidden');
+  thinking = false;
+
   if (!resp.ok) {
     const err = await resp.json();
     console.warn('search API error:', err);
@@ -213,29 +247,36 @@ async function makeMove(r, c) {
 
   const newState = await resp.json();
   state = newState;
-
-  // Show thinking indicator before AI move
-  if (newState.ai_move) {
-    thinking = true;
-    thinkingEl.classList.remove('hidden');
-    drawBoard({ ...newState, last_move: [r, c] });
-    await new Promise(r => setTimeout(r, 300));
-    thinkingEl.classList.add('hidden');
-    thinking = false;
-  }
+  humanPlayer = newState.human_player;
+  currentStrength = newState.strength || currentStrength;
 
   drawBoard(newState);
   updateStatus(newState);
   updateSearchPanel(newState.search, newState.ai_move);
 }
 
-async function resetGame() {
-  const resp = await fetch('/api/new-game', { method: 'POST' });
+async function startNewGame(side, strength) {
+  // Show thinking while server computes AI opening (only relevant for White side).
+  thinking = true;
+  thinkingEl.classList.remove('hidden');
+
+  const resp = await fetch('/api/new-game', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ side, strength }),
+  });
+
+  thinkingEl.classList.add('hidden');
+  thinking = false;
+
   const newState = await resp.json();
   state = newState;
+  humanPlayer = newState.human_player;
+  currentStrength = newState.strength || strength;
+
   drawBoard(newState);
   updateStatus(newState);
-  searchPanel.classList.remove('visible');
+  updateSearchPanel(newState.search, newState.ai_move);
 }
 
 // ─── Canvas click handler ───
@@ -286,8 +327,41 @@ document.getElementById('panel-close').addEventListener('click', () => {
   searchPanel.classList.remove('visible');
 });
 
-document.getElementById('btn-new-game').addEventListener('click', resetGame);
+document.getElementById('btn-new-game').addEventListener('click', () => {
+  const side = sideBlackBtn.classList.contains('active') ? 'black' : 'white';
+  startNewGame(side, currentStrength);
+});
+
+sideBlackBtn.addEventListener('click', () => {
+  if (!sideBlackBtn.classList.contains('active')) {
+    selectSide('black');
+  }
+});
+
+sideWhiteBtn.addEventListener('click', () => {
+  if (!sideWhiteBtn.classList.contains('active')) {
+    selectSide('white');
+  }
+});
+
+strengthFastBtn.addEventListener('click', () => {
+  if (!strengthFastBtn.classList.contains('active')) {
+    selectStrength('fast');
+  }
+});
+
+strengthMedBtn.addEventListener('click', () => {
+  if (!strengthMedBtn.classList.contains('active')) {
+    selectStrength('medium');
+  }
+});
+
+strengthStrongBtn.addEventListener('click', () => {
+  if (!strengthStrongBtn.classList.contains('active')) {
+    selectStrength('strong');
+  }
+});
 
 // ─── Init ───
 
-resetGame();
+startNewGame('black', 'medium');

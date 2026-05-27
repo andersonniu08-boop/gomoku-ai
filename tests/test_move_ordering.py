@@ -40,14 +40,18 @@ def test_empty_input_returns_empty():
     assert result == []
 
 
-def test_keeps_all_moves_when_under_max():
-    """When there are fewer moves than max_moves, all should be kept."""
+def test_respects_max_moves():
+    """When legal moves exceed max_moves, output should be capped."""
     board = Board()
     board.make_move(7, 7)
     board.make_move(8, 8)
     probs = _uniform_probs(board)
-    result = order_and_filter_moves(board, probs, max_moves=50)
-    assert len(result) == len(probs)
+    result = order_and_filter_moves(board, probs, max_moves=40)
+    assert len(result) <= 40
+    # All kept moves must be legal.
+    legal = set(board.get_legal_moves())
+    for m, _ in result:
+        assert m in legal
 
 
 def test_output_is_normalized():
@@ -269,16 +273,16 @@ def test_compute_scores_blocking_move():
 
 
 def test_no_tactical_moves_on_scattered_board():
-    """With scattered stones and no threats, all moves should survive but
-    with moderate scores."""
+    """With scattered stones and no threats, output should be capped to
+    max_moves and normalized."""
     board = Board()
     board.make_move(3, 3)
     board.make_move(10, 10)
     board.make_move(7, 7)
     probs = _uniform_probs(board)
     result = order_and_filter_moves(board, probs, max_moves=40)
-    # All moves should still be in the result (fewer than max_moves)
-    assert len(result) == len(probs)
+    # Capped to max_moves since legal moves exceed it.
+    assert len(result) <= 40
     total = sum(p for _, p in result)
     assert abs(total - 1.0) < 1e-5
 
@@ -315,12 +319,37 @@ def test_threat_boost_disabled():
     # Without boost, should still return valid distribution
     total = sum(p for _, p in result)
     assert abs(total - 1.0) < 1e-5
-    # All legal moves should be present (fewer than max_moves)
-    legal = board.get_legal_moves()
-    assert len(result) == len(legal)
-    # Without boost, all priors should be equal (uniform input)
+    # Without boost, all unpadded priors should be equal (uniform input)
     priors = [p for _, p in result]
     assert all(abs(p - priors[0]) < 1e-5 for p in priors)
+
+
+def test_non_adjacent_moves_survive_filtering():
+    """Non-adjacent moves must survive in the output if they rank high
+    enough by prior — adjacency is NOT a legality constraint."""
+    board = Board()
+    board.make_move(7, 7)
+    board.make_move(8, 8)
+    legal = board.get_legal_moves()
+    # Verify that some non-adjacent positions are legal.
+    non_adjacent = [(0, 0), (0, 14), (14, 0), (14, 14)]
+    for pos in non_adjacent:
+        assert pos in legal, f"Non-adjacent position {pos} must be legal"
+
+    probs = _uniform_probs(board)
+    result = order_and_filter_moves(board, probs, max_moves=40)
+    surviving = {m for m, _ in result}
+
+    # With uniform priors, non-adjacent moves are just as likely as
+    # adjacent ones.  The output should contain a mix.
+    assert len(surviving) == 40  # capped at max_moves
+    # At least some non-adjacent moves should be in the output (they
+    # all have the same prior, so the top 40 of ~223 includes many).
+    surviving_non_adjacent = surviving & set(non_adjacent)
+    assert len(surviving_non_adjacent) > 0, (
+        f"No non-adjacent moves survived filtering. "
+        f"Surviving: {surviving}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -443,7 +472,7 @@ def test_mcts_finds_immediate_win_with_tactical_ordering():
 
     wrapper, tmp = _make_mcts_wrapper()
     try:
-        mcts = MCTS(wrapper, num_simulations=20, threat_override=False)
+        mcts = MCTS(wrapper, num_simulations=50, threat_override=False)
         board = Board()
         # Black open four at (7,2)-(7,5)
         _place_many(board, [
@@ -454,13 +483,20 @@ def test_mcts_finds_immediate_win_with_tactical_ordering():
         ])
 
         dist = mcts.search(board)
-        # Winning moves should appear in the distribution.
-        # With threat_override=False and an untrained network at 20 sims,
-        # the MCTS may not fully converge, but tactical ordering should
-        # ensure the winning moves are explored (not pruned).
-        assert (7, 1) in dist or (7, 6) in dist
-        # At least one winning move should have non-trivial probability
+        # Winning moves must appear in the distribution. With 225 legal moves
+        # and an untrained network, the priors are diffuse, but tactical
+        # ordering gives winning moves a huge boost (CREATE_FIVE = 1000x).
+        # 50 simulations should be enough to visit them.
+        assert (7, 1) in dist or (7, 6) in dist, (
+            "No winning move in MCTS distribution — tactical pruning may "
+            "have dropped winning moves."
+        )
+        # With tactical boost, the winning move(s) should have accumulated
+        # non-trivial visit probability.
         win_prob = max(dist.get((7, 1), 0), dist.get((7, 6), 0))
-        assert win_prob > 0.01, f"Highest winning-move probability is only {win_prob:.4f}"
+        assert win_prob > 0.005, (
+            f"Highest winning-move probability is only {win_prob:.4f} — "
+            f"tactical boost may not be propagating through MCTS."
+        )
     finally:
         tmp.unlink()

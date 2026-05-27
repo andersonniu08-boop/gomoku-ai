@@ -433,30 +433,38 @@ def test_batch_evaluate_with_threats_immediate_win():
 
 
 def test_batch_evaluate_with_threats_block_boosting():
-    """When the opponent has an OPEN_FOUR, blocking moves get boosted."""
+    """When the opponent has a threatening pattern, blocking moves get boosted.
+
+    Uses a position where the opponent has OPEN_THREEs (not OPEN_FOUR) so
+    the hard-override path (``must_block``) is NOT triggered — only the
+    neural-prior boost path (``boosted_blocks``).
+    """
     wrapper = next(_make_wrapper())
     board = Board()
-    # White sets up an OPEN_FOUR while Black plays dummies.
+    # White builds an open-three at row 7, cols 3-5 and a second open-three
+    # nearby.  Black plays scattered dummies that form no threat.
+    # NOTE: Black's stones must not form any threat themselves.
     board.make_move(0, 0)  # Black
     board.make_move(7, 3)  # White
-    board.make_move(0, 1)  # Black
+    board.make_move(2, 2)  # Black
     board.make_move(7, 4)  # White
-    board.make_move(0, 2)  # Black
+    board.make_move(0, 4)  # Black
     board.make_move(7, 5)  # White
-    board.make_move(0, 3)  # Black
-    board.make_move(7, 6)  # White
+    board.make_move(2, 6)  # Black
+    board.make_move(6, 6)  # White — builds a second threat pattern
 
-    # Now it's Black's turn. White has OPEN_FOUR — Black must block.
+    # Black's turn.  White has an open-three at (7,3)-(7,5).
+    # Must_block is NOT triggered (only OPEN_FOUR/CLOSED_FOUR trigger it),
+    # but urgent_blocks is populated → boosted_blocks kicks in.
     results = wrapper.batch_evaluate_with_threats([board])
     probs, value, info = results[0]
 
     assert info is not None
     assert info["reason"] == "boosted_blocks"
     assert -1.0 <= value <= 1.0
-    # Distribution is valid.
     total = sum(p for _, p in probs)
     assert abs(total - 1.0) < 1e-5
-    # Block moves are present in the distribution.
-    block_moves = {(7, 2), (7, 7)}
+    # Block moves should be present in the distribution.
+    block_moves = {(7, 2), (7, 6), (5, 6), (7, 6)}
     for m in block_moves:
         assert m in dict(probs)

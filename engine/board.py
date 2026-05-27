@@ -22,7 +22,7 @@ class Board:
 
     Optimized for MCTS:
     - O(1) make/undo via move history stack
-    - get_legal_moves returns neighbours of existing stones (sparse)
+    - get_legal_moves returns all empty board positions (standard Gomoku)
     - check_win uses incremental axis scan from last move
     - Board state is copyable for parallel simulations
     """
@@ -37,9 +37,6 @@ class Board:
         self.current_player: Player = Player.BLACK
         self.move_history: list[tuple[int, int]] = []
         self._winner: Optional[Player] = None
-        # Track which positions are adjacent to at least one stone,
-        # used to narrow legal moves to meaningful candidates.
-        self._neighbor_set: set[tuple[int, int]] = set()
 
     # ------------------------------------------------------------------
     # Core operations
@@ -57,9 +54,6 @@ class Board:
         self.grid[row, col] = self.current_player
         self.move_history.append((row, col))
 
-        self._update_neighbors(row, col)
-        self._neighbor_set.discard((row, col))
-
         if self._check_win_at(row, col):
             self._winner = self.current_player
 
@@ -74,16 +68,6 @@ class Board:
         player = Player(self.grid[row, col])
         self.grid[row, col] = 0
 
-        # Restore neighbor set: recompute from scratch only around
-        # the undone cell — remove it, then re-add for remaining
-        # stones in its neighbourhood.
-        self._remove_stone_neighbors(row, col)
-        self._add_neighbors_for(row, col)
-
-        # If the board is now empty, neighbor set should be empty too.
-        if not self.move_history:
-            self._neighbor_set.clear()
-
         self._winner = None
         self.current_player = player
 
@@ -92,19 +76,18 @@ class Board:
     # ------------------------------------------------------------------
 
     def get_legal_moves(self) -> list[tuple[int, int]]:
-        """Return candidate moves ordered for MCTS expansion.
+        """Return all empty board positions.
 
-        Returns positions adjacent to existing stones. If the board is
-        empty, returns the center. This keeps the branching factor
-        manageable (~20-40 instead of 225).
+        Any empty square is a legal move in standard Gomoku.  The MCTS
+        layer applies its own pruning (via ``order_and_filter_moves``) to
+        keep the branching factor manageable during search.
         """
-        if not self.move_history:
-            center = self.SIZE // 2
-            return [(center, center)]
-
-        # Filter to truly empty cells (undo may have invalidated some)
-        moves = [pos for pos in self._neighbor_set if self.grid[pos] == 0]
-        return moves
+        return [
+            (r, c)
+            for r in range(self.SIZE)
+            for c in range(self.SIZE)
+            if self.grid[r, c] == 0
+        ]
 
     def check_win(self) -> Optional[Player]:
         """Return the winner, or None if no winner yet."""
@@ -125,7 +108,6 @@ class Board:
         new.current_player = self.current_player
         new.move_history = self.move_history.copy()
         new._winner = self._winner
-        new._neighbor_set = self._neighbor_set.copy()
         return new
 
     def __repr__(self) -> str:
@@ -143,48 +125,6 @@ class Board:
 
     def _in_bounds(self, row: int, col: int) -> bool:
         return 0 <= row < self.SIZE and 0 <= col < self.SIZE
-
-    def _update_neighbors(self, row: int, col: int) -> None:
-        """Add empty neighbours of (row, col) to the candidate set."""
-        for dr in (-1, 0, 1):
-            for dc in (-1, 0, 1):
-                if dr == 0 and dc == 0:
-                    continue
-                nr, nc = row + dr, col + dc
-                if self._in_bounds(nr, nc) and self.grid[nr, nc] == 0:
-                    self._neighbor_set.add((nr, nc))
-
-    def _remove_stone_neighbors(self, row: int, col: int) -> None:
-        """Remove neighbour entries that were only reachable via (row, col)."""
-        for dr in (-1, 0, 1):
-            for dc in (-1, 0, 1):
-                if dr == 0 and dc == 0:
-                    continue
-                nr, nc = row + dr, col + dc
-                if self._in_bounds(nr, nc) and self.grid[nr, nc] == 0:
-                    # Keep only if another stone still neighbours it
-                    if not self._has_adjacent_stone(nr, nc):
-                        self._neighbor_set.discard((nr, nc))
-
-    def _add_neighbors_for(self, row: int, col: int) -> None:
-        """Re-add neighbour entries for stones surrounding (row, col)."""
-        for dr in (-1, 0, 1):
-            for dc in (-1, 0, 1):
-                if dr == 0 and dc == 0:
-                    continue
-                nr, nc = row + dr, col + dc
-                if self._in_bounds(nr, nc) and self.grid[nr, nc] != 0:
-                    self._update_neighbors(nr, nc)
-
-    def _has_adjacent_stone(self, row: int, col: int) -> bool:
-        for dr in (-1, 0, 1):
-            for dc in (-1, 0, 1):
-                if dr == 0 and dc == 0:
-                    continue
-                nr, nc = row + dr, col + dc
-                if self._in_bounds(nr, nc) and self.grid[nr, nc] != 0:
-                    return True
-        return False
 
     def _check_win_at(self, row: int, col: int) -> bool:
         """Check if the stone at (row, col) completes 5-in-a-row."""

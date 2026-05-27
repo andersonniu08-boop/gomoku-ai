@@ -58,15 +58,12 @@ def test_legal_human_move():
 
 
 def test_illegal_human_move():
-    """An illegal human move produces legal=False and no human_candidate."""
+    """An illegal (occupied) human move produces legal=False and no human_candidate."""
     wrapper, tmp = _make_wrapper()
     try:
-        board, _ = _board_with_legal_move()
-        illegal = (0, 0)  # Should not be adjacent to any stone.
-        # Ensure it's actually illegal.
-        legal_set = set(board.get_legal_moves())
-        while illegal in legal_set:
-            illegal = (illegal[0] + 1, illegal[1] + 1)
+        board, _ = _board_with_legal_move()  # stones at (7,7) and (6,6)
+        # An occupied cell is always an illegal move.
+        illegal = (7, 7)
         comp = compare_move(wrapper, board, illegal, num_simulations=10)
         assert comp.legal is False
         assert comp.human_candidate is None
@@ -210,11 +207,11 @@ def test_from_dict_roundtrip_fast():
 
 
 def test_from_dict_roundtrip_illegal():
-    """Roundtrip with illegal move works."""
+    """Roundtrip with illegal (occupied) move works."""
     wrapper, tmp = _make_wrapper()
     try:
-        board, _ = _board_with_legal_move()
-        illegal = (0, 0)
+        board, _ = _board_with_legal_move()  # stones at (7,7) and (6,6)
+        illegal = (6, 6)  # occupied cell
         comp = compare_move(wrapper, board, illegal, num_simulations=10)
         d = comp.to_dict()
         reconstructed = MoveComparison.from_dict(d)
@@ -293,13 +290,13 @@ def test_search_stats_contains_num_simulations():
 
 
 def test_human_rank_in_top_k():
-    """Human rank is 1 <= rank <= top_k when human move is in top-k."""
+    """Human rank is >= 1 when the human move is legal (may be outside top-k)."""
     wrapper, tmp = _make_wrapper()
     try:
         board, human_move = _board_with_legal_move()
         comp = compare_move(wrapper, board, human_move, num_simulations=30, top_k=10)
         if comp.human_rank is not None:
-            assert 1 <= comp.human_rank <= 10
+            assert comp.human_rank >= 1
     finally:
         tmp.unlink()
 
@@ -420,11 +417,11 @@ def test_fast_path_value_before_matches():
 
 
 def test_value_after_none_on_illegal_move():
-    """value_after should be None when the human move is illegal."""
+    """value_after should be None when the human move is illegal (occupied)."""
     wrapper, tmp = _make_wrapper()
     try:
-        board, _ = _board_with_legal_move()
-        illegal = (0, 0)
+        board, _ = _board_with_legal_move()  # stones at (7,7) and (6,6)
+        illegal = (7, 7)  # occupied cell is always illegal
         comp = compare_move(wrapper, board, illegal, num_simulations=10)
         assert comp.legal is False
         assert comp.value_after is None

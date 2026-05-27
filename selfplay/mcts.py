@@ -10,15 +10,11 @@ from typing import Optional
 import torch
 
 from engine.board import Board, Player
-from engine.threats import ThreatDetector, ThreatType
+from engine.tactical import TacticalAnalysis, TacticalSolver
 from neural.wrapper import GomokuInferenceWrapper
 from selfplay.evaluator import BatchedLeafEvaluator
 from selfplay.move_ordering import order_and_filter_moves
 from selfplay.profiler import Profiler
-
-# When there are more legal moves than this, keep only the top-N priors
-# to bound the branching factor.
-_POLICY_CUTOFF = 40
 
 
 @dataclass(slots=True)
@@ -93,6 +89,7 @@ class MCTS:
         c_puct: float = 2.5,
         num_simulations: int = 400,
         batch_size: int = 32,
+        policy_cutoff: int = 40,
         threat_override: bool = True,
         dirichlet_alpha: Optional[float] = None,
         dirichlet_epsilon: float = 0.25,
@@ -103,6 +100,7 @@ class MCTS:
         self.c_puct = c_puct
         self.num_simulations = num_simulations
         self.batch_size = batch_size
+        self.policy_cutoff = policy_cutoff
         self.threat_override = threat_override
         self.dirichlet_alpha = dirichlet_alpha
         self.dirichlet_epsilon = dirichlet_epsilon
@@ -275,21 +273,27 @@ class MCTS:
                             # we negate here.  Terminal values from _terminal_value
                             # already use the correct convention (+1 = mover won).
                             value = -value
-                            # Expand leaf.  When the branching factor exceeds the
-                            # cutoff, use tactical move ordering so critical
-                            # moves (wins, blocks) survive pruning.  Common
-                            # case (≤ cutoff) is a no-op — neural priors
-                            # pass through without board-copy overhead.
+                            # Tactical value injection: override the
+                            # neural value when the position is
+                            # tactically decided.  If the leaf's
+                            # current_player can force a win, the
+                            # player who moved to reach this leaf is
+                            # losing — the neural net may miss this.
+                            with self.profiler.measure("expand.tactical_value"):
+                                tactical = TacticalSolver.analyze_lightweight(
+                                    leaf_boards[i]
+                                )
+                                if tactical.has_forced_win:
+                                    value = -1.0
+                            # Always apply tactical prior adjustment so
+                            # critical moves (wins, blocks, threats)
+                            # survive pruning and get adequate PUCT
+                            # exploration.  When ≤ self.policy_cutoff moves,
+                            # none are pruned — only re-weighted.
                             with self.profiler.measure("expand.order_and_filter"):
-                                if len(move_probs) > _POLICY_CUTOFF:
-                                    move_probs = order_and_filter_moves(
-                                        leaf_boards[i], move_probs, max_moves=_POLICY_CUTOFF
-                                    )
-                                else:
-                                    # Renormalise — evaluator may return
-                                    # probabilities that don't sum exactly to 1.
-                                    total = sum(p for _, p in move_probs)
-                                    move_probs = [(m, p / total) for m, p in move_probs]
+                                move_probs = order_and_filter_moves(
+                                    leaf_boards[i], move_probs, max_moves=self.policy_cutoff
+                                )
                             with self.profiler.measure("expand.create_nodes"):
                                 for (r, c), prior in move_probs:
                                     leaf_node.children[(r, c)] = MCTSNode(prior=prior)
@@ -384,63 +388,13 @@ class MCTS:
 
     def _check_forced(self, board: Board) -> Optional[dict[tuple[int, int], float]]:
         """Return a deterministic move distribution when the position contains
-        an immediate win or must-block threat, bypassing MCTS entirely."""
-        threats = ThreatDetector.detect_all(board, board.current_player)
-        opp_threats = ThreatDetector.detect_all(
-            board, Player(-board.current_player)
-        )
+        an immediate win, must-block threat, or forced sequence, bypassing
+        MCTS entirely.
 
-        legal = board.get_legal_moves()
-        legal_set = set(legal)
-
-        # 1) Immediate winning moves for the current player — play one.
-        #
-        # FIVE and OPEN_FOUR: every open end and/or gap is a winning move
-        #   (placing there completes five-in-a-row).
-        #
-        # CLOSED_FOUR behaviour depends on the pattern:
-        #   * Contiguous four with one open end (XXXX_): the open end IS a
-        #     winning move — placing there creates five-in-a-row.
-        #   * Split four (XX_XX, XXX_X): the *gap* is a winning move — filling
-        #     it gives five-in-a-row.  The external open ends are NOT winning
-        #     moves because they extend the split pattern without producing
-        #     five consecutive stones.
-        win_moves: set[tuple[int, int]] = set()
-        for t in threats:
-            if t.threat_type == ThreatType.CLOSED_FOUR:
-                if t.gap is not None:
-                    # Split closed four — only the gap creates five-in-a-row.
-                    win_moves.add(t.gap)
-                else:
-                    # Contiguous closed four — the one open end creates five.
-                    for end in t.open_ends:
-                        win_moves.add(end)
-            elif t.threat_type in (ThreatType.FIVE, ThreatType.OPEN_FOUR):
-                for end in t.open_ends:
-                    win_moves.add(end)
-                if t.gap is not None:
-                    win_moves.add(t.gap)
-
-        win_moves &= legal_set
-        if win_moves:
-            return {m: 1.0 / len(win_moves) for m in win_moves}
-
-        # 2) Opponent has an open four — must block.
-        opp_open_fours = [
-            t for t in opp_threats if t.threat_type == ThreatType.OPEN_FOUR
-        ]
-        if opp_open_fours:
-            block_set: set[tuple[int, int]] = set()
-            for t in opp_open_fours:
-                if t.gap is not None:
-                    block_set.add(t.gap)
-                for end in t.open_ends:
-                    block_set.add(end)
-            block_moves = list(block_set & legal_set)
-            if block_moves:
-                return {m: 1.0 / len(block_moves) for m in block_moves}
-
-        return None
+        Delegates to :class:`TacticalSolver` for all threat resolution.
+        """
+        analysis = TacticalSolver.analyze(board)
+        return analysis.get_forced_distribution()
 
     # ------------------------------------------------------------------
     # Helpers

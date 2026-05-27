@@ -134,6 +134,37 @@ class ThreatDetector:
         return counts
 
     @staticmethod
+    def get_completion_cells(threat: Threat) -> list[tuple[int, int]]:
+        """Return the empty cells that complete *threat* into five-in-a-row.
+
+        These are the cells the threat owner should play to win, and the
+        cells the opponent must block to defend.
+
+        - **FIVE**: already complete (returns empty list).
+        - **OPEN_FOUR**: every open end and the gap (if any).
+        - **CLOSED_FOUR** (split, has gap): only the gap.
+        - **CLOSED_FOUR** (contiguous, no gap): the single open end.
+        - **OPEN_THREE**: every open end and the gap (if any).
+        """
+        if threat.threat_type == ThreatType.FIVE:
+            return []
+        if threat.threat_type == ThreatType.OPEN_FOUR:
+            cells = list(threat.open_ends)
+            if threat.gap is not None:
+                cells.append(threat.gap)
+            return cells
+        if threat.threat_type == ThreatType.CLOSED_FOUR:
+            if threat.gap is not None:
+                return [threat.gap]
+            return list(threat.open_ends)
+        if threat.threat_type == ThreatType.OPEN_THREE:
+            cells = list(threat.open_ends)
+            if threat.gap is not None:
+                cells.append(threat.gap)
+            return cells
+        return []
+
+    @staticmethod
     def evaluate(board: Board, player: Player) -> float:
         """Heuristic score from *player*'s perspective.
 
