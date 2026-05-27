@@ -111,15 +111,21 @@ def train_on_examples(
     batch_size: int,
     scheduler: Optional[CosineAnnealingLR] = None,
     device: Optional[str] = None,
+    scaler: Optional[torch.amp.GradScaler] = None,
 ) -> dict[str, float]:
     """Train the model for one pass over *examples*.
 
     Examples are shuffled before batching.  Returns a dict with keys
     ``loss``, ``policy_loss``, ``value_loss``, and ``entropy``.
+
+    When *scaler* is provided (CUDA with mixed precision), the forward
+    pass runs under ``torch.amp.autocast`` and gradients are unscaled
+    before the optimizer step.
     """
     random.shuffle(examples)
     model.train()
 
+    use_amp = scaler is not None
     total_loss = 0.0
     total_policy = 0.0
     total_value = 0.0
@@ -139,18 +145,25 @@ def train_on_examples(
             target_policies = target_policies.to(device)
             target_values = target_values.to(device)
 
-        log_policy, value = model(states)
-        policy_loss, value_loss, total = compute_loss(
-            log_policy, value, target_policies, target_values
-        )
+        with torch.amp.autocast(device_type="cuda", enabled=use_amp):
+            log_policy, value = model(states)
+            policy_loss, value_loss, total = compute_loss(
+                log_policy, value, target_policies, target_values
+            )
 
         # Policy entropy: H(P) = -sum(P * log P)
         probs = torch.exp(log_policy)
         entropy = -(probs * log_policy).sum(dim=1).mean()
 
         optimizer.zero_grad()
-        total.backward()
-        optimizer.step()
+        if use_amp:
+            scaler.scale(total).backward()
+            scaler.unscale_(optimizer)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            total.backward()
+            optimizer.step()
         if scheduler is not None:
             scheduler.step()
 
@@ -296,6 +309,9 @@ def main(
     batches_per_iter = max(1, (batch_size * 10 + batch_size - 1) // batch_size)
     scheduler = CosineAnnealingLR(optimizer, T_max=num_iterations * batches_per_iter)
 
+    # Mixed-precision GradScaler for CUDA training.
+    scaler = torch.amp.GradScaler("cuda") if "cuda" in device else None
+
     for iteration in range(1, num_iterations + 1):
         iter_start = time.monotonic()
 
@@ -339,7 +355,8 @@ def main(
         model.load_state_dict(state_dict)
 
         metrics = train_on_examples(
-            model, optimizer, train_examples, batch_size, scheduler, device=device
+            model, optimizer, train_examples, batch_size, scheduler,
+            device=device, scaler=scaler,
         )
 
         save_model_checkpoint(model, latest_path)

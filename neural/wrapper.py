@@ -59,6 +59,14 @@ class GomokuInferenceWrapper:
         self.model.load_state_dict(checkpoint)
         self.model.eval()
 
+        # Enable TF32 tensor cores for ~2× matmul throughput on Ampere+.
+        torch.set_float32_matmul_precision("high")
+
+        # Keep a reference to the uncompiled model for hook-based
+        # introspection (explainability tools register forward hooks
+        # on res_blocks, which a torch.compiled model would bypass).
+        self._raw_model = self.model
+
     # ------------------------------------------------------------------
     # Shared threat helpers used by evaluate_with_threats and
     # batch_evaluate_with_threats.
@@ -161,7 +169,7 @@ class GomokuInferenceWrapper:
         Callers must manage gradients and device placement on the result.
         """
         tensor = board_to_tensor(board).to(self.device)
-        return self.model(tensor)
+        return self._raw_model(tensor)
 
     def batch_evaluate(
         self, boards: list[Board]

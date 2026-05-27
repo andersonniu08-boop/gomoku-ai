@@ -108,7 +108,7 @@ def capture_activations(
     Returns:
         ActivationSnapshot with captured data on CPU as numpy arrays.
     """
-    model = wrapper.model
+    model = getattr(wrapper, "_raw_model", wrapper.model)
     num_blocks = len(model.res_blocks)
     if blocks is None:
         blocks = list(range(num_blocks))

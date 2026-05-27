@@ -137,9 +137,13 @@ class BatchedLeafEvaluator:
             tensor = torch.from_numpy(arr).to(self.device)
 
         # --- Batched forward pass -------------------------------------
+        # autocast gives ~2× throughput on tensor-core GPUs.
         with self.profiler.measure("eval.model_forward"):
             with torch.no_grad():
-                log_policy, value = self.wrapper.model(tensor)
+                with torch.amp.autocast(
+                    device_type=self.device.type, enabled=self.device.type == "cuda"
+                ):
+                    log_policy, value = self.wrapper.model(tensor)
 
         # --- Efficient result extraction ------------------------------
         with self.profiler.measure("eval.postprocess"):
