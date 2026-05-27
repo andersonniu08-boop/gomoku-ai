@@ -425,20 +425,31 @@ class MCTS:
         if win_moves:
             return {m: 1.0 / len(win_moves) for m in win_moves}
 
-        # 2) Opponent has an open four — must block.
-        opp_open_fours = [
-            t for t in opp_threats if t.threat_type == ThreatType.OPEN_FOUR
-        ]
-        if opp_open_fours:
-            block_set: set[tuple[int, int]] = set()
-            for t in opp_open_fours:
+        # 2) Opponent threats that demand an immediate block.
+        #
+        #     An opponent FIVE (gapped) or OPEN_FOUR means the opponent
+        #     can win on their next move.  An opponent CLOSED_FOUR
+        #     (either contiguous with one open end, or split with a gap)
+        #     also wins on their next turn — we must block every cell
+        #     that completes five-in-a-row for the opponent.
+        block_set: set[tuple[int, int]] = set()
+        for t in opp_threats:
+            if t.threat_type in (ThreatType.FIVE, ThreatType.OPEN_FOUR):
                 if t.gap is not None:
                     block_set.add(t.gap)
                 for end in t.open_ends:
                     block_set.add(end)
-            block_moves = list(block_set & legal_set)
-            if block_moves:
-                return {m: 1.0 / len(block_moves) for m in block_moves}
+            elif t.threat_type == ThreatType.CLOSED_FOUR:
+                if t.gap is not None:
+                    # Split closed four — gap creates five.
+                    block_set.add(t.gap)
+                else:
+                    # Contiguous closed four — open end creates five.
+                    for end in t.open_ends:
+                        block_set.add(end)
+        block_moves = list(block_set & legal_set)
+        if block_moves:
+            return {m: 1.0 / len(block_moves) for m in block_moves}
 
         return None
 

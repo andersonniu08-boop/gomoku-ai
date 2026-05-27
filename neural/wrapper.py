@@ -98,10 +98,21 @@ class GomokuInferenceWrapper:
     def _block_moves(
         opp_threats: list, legal_set: set[tuple[int, int]]
     ) -> set[tuple[int, int]]:
-        """Return legal moves that block opponent OPEN_FOUR threats."""
+        """Return legal moves that block opponent threats.
+
+        Covers every opponent threat that can win on the next turn
+        (FIVE, OPEN_FOUR, CLOSED_FOUR) as well as credible developing
+        threats (OPEN_THREE) that demand a response.
+        """
         moves: set[tuple[int, int]] = set()
         for t in opp_threats:
-            if t.threat_type == ThreatType.OPEN_FOUR:
+            if t.threat_type == ThreatType.CLOSED_FOUR:
+                if t.gap is not None:
+                    moves.add(t.gap)
+                else:
+                    for end in t.open_ends:
+                        moves.add(end)
+            elif t.threat_type in (ThreatType.FIVE, ThreatType.OPEN_FOUR, ThreatType.OPEN_THREE):
                 if t.gap is not None:
                     moves.add(t.gap)
                 for end in t.open_ends:

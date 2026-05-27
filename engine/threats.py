@@ -236,15 +236,20 @@ class ThreatDetector:
         n = len(stones)
         num_open = len(open_ends)
 
-        # Five (or more) — immediate win.
+        # Five (or more).  When *gap* is ``None`` this is a true
+        # five-in-a-row (game already decided).  When *gap* is set we
+        # have a gapped five (e.g. XXX_XX — 5 stones, 1 gap) whose
+        # winning cell is exactly the gap.  Preserve both fields so
+        # _winning_moves in the wrapper and _check_forced in MCTS can
+        # extract the correct winning move(s).
         if n >= 5:
             return Threat(
                 threat_type=ThreatType.FIVE,
                 player=player,
                 stones=stones[:5],
                 direction=(dr, dc),
-                open_ends=[],
-                gap=None,
+                open_ends=open_ends,
+                gap=gap,
             )
 
         if n == 4:
@@ -271,9 +276,17 @@ class ThreatDetector:
         if gap is not None:
             # Split four (XXX_X, XX_XX, etc.).  The gap is the only
             # winning cell → at least a closed-four-level threat.
+            # Even when both ends are blocked (num_open == 0) the gap
+            # still produces five-in-a-row, so never return None here.
             if num_open >= 1:
                 return Threat(
                     ThreatType.CLOSED_FOUR, player, stones, (dr, dc), open_ends, gap=gap
+                )
+            else:
+                # Fully enclosed split four — still a forced winning
+                # move at the gap.
+                return Threat(
+                    ThreatType.CLOSED_FOUR, player, stones, (dr, dc), [], gap=gap
                 )
         else:
             # Contiguous four.
