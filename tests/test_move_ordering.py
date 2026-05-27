@@ -156,12 +156,13 @@ def test_split_four_gap_must_survive():
 def test_block_open_four_survives():
     """A move that blocks opponent's open four must survive pruning."""
     board = Board()
-    # Opponent (White) has open four at (7,2)-(7,5)
+    # Opponent (White) has open four at (7,2)-(7,5).
+    # Black stones are scattered (no threat of their own).
     _place_many(board, [
-        (0, 0), (7, 2),  # White starts open four
-        (0, 1), (7, 3),
-        (0, 2), (7, 4),
-        (0, 3), (7, 5),
+        (8, 0), (7, 2),  # B scattered, W starts open four
+        (8, 2), (7, 3),  # B scattered
+        (8, 4), (7, 4),  # B scattered
+        (8, 6), (7, 5),  # B scattered
     ])
     # Now Black to move. White has open four. Black must block at (7,1) or (7,6).
     probs = _uniform_probs(board)

@@ -51,6 +51,7 @@ def order_and_filter_moves(
     max_moves: int = 40,
     *,
     threat_boost: bool = True,
+    hard_override: bool = True,
 ) -> list[tuple[tuple[int, int], float]]:
     """Filter and reorder *move_probs* for tactical relevance.
 
@@ -69,6 +70,11 @@ def order_and_filter_moves(
     threat_boost:
         When True, compute tactical scores and adjust priors.  Set False
         to skip tactical analysis (useful for ablation benchmarks).
+    hard_override:
+        When True and forced winning / must-block moves exist, return
+        **only** those moves — mirroring ``_check_forced`` at the root.
+        This catches deep tactical wins that the network might otherwise
+        undervalue.
 
     Returns
     -------
@@ -103,6 +109,18 @@ def order_and_filter_moves(
             candidates.append((m, adjusted))
 
     # --- Phase 3: build the final list ---
+    # Hard override: when forced winning / must-block moves exist, expand
+    # only those — the search must explore the tactical line immediately.
+    if hard_override and must_keep:
+        forced = [(m, p) for m, p in must_keep
+                  if scores.get(m, 0) >= _BLOCK_FIVE or scores.get(m, 0) >= _CREATE_FIVE]
+        if forced:
+            total = sum(p for _, p in forced)
+            if total > 0:
+                return [(m, p / total) for m, p in forced]
+            k = len(forced)
+            return [(m, 1.0 / k) for m, _ in forced]
+
     # Sort candidates by adjusted prior, descending.
     candidates.sort(key=lambda x: x[1], reverse=True)
 

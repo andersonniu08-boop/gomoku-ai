@@ -277,21 +277,18 @@ class MCTS:
                             # we negate here.  Terminal values from _terminal_value
                             # already use the correct convention (+1 = mover won).
                             value = -value
-                            # Expand leaf.  When the branching factor exceeds the
-                            # cutoff, use tactical move ordering so critical
-                            # moves (wins, blocks) survive pruning.  Common
-                            # case (≤ cutoff) is a no-op — neural priors
-                            # pass through without board-copy overhead.
+                            # Expand leaf.  Always compute tactical scores
+                            # when threat_override is enabled so forced
+                            # wins / must-blocks deep in the tree are
+                            # caught immediately rather than relying on
+                            # the network's value head alone.
                             with self.profiler.measure("expand.order_and_filter"):
-                                if len(move_probs) > _POLICY_CUTOFF:
-                                    move_probs = order_and_filter_moves(
-                                        leaf_boards[i], move_probs, max_moves=_POLICY_CUTOFF
-                                    )
-                                else:
-                                    # Renormalise — evaluator may return
-                                    # probabilities that don't sum exactly to 1.
-                                    total = sum(p for _, p in move_probs)
-                                    move_probs = [(m, p / total) for m, p in move_probs]
+                                move_probs = order_and_filter_moves(
+                                    leaf_boards[i],
+                                    move_probs,
+                                    max_moves=_POLICY_CUTOFF,
+                                    hard_override=self.threat_override,
+                                )
                             with self.profiler.measure("expand.create_nodes"):
                                 for (r, c), prior in move_probs:
                                     leaf_node.children[(r, c)] = MCTSNode(prior=prior)
