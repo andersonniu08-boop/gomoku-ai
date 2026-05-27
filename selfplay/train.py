@@ -16,7 +16,7 @@ from neural.model import GomokuNet
 from neural.wrapper import GomokuInferenceWrapper
 from selfplay.mcts import MCTS
 from selfplay.replay_buffer import ReplayBuffer
-from selfplay.selfplay import SelfPlayGame, TrainingExample, augment_examples
+from selfplay.selfplay import SelfPlayGame, TrainingExample
 
 
 def compute_loss(
@@ -85,11 +85,9 @@ def ingest_game_files(
             print(f"  [trainer] Skipping empty/invalid file: {path.name}")
             continue
 
-        # Worker files are written raw (augment=False).  Apply D₄ symmetries
-        # on ingest so the buffer always contains augmented data regardless
-        # of source, matching the local fallback path (SelfPlayGame w/
-        # augment=True).  8× data per game.
-        examples = augment_examples(examples)
+        # Worker files are written without augmentation (augment=False).
+        # The ReplayBuffer applies random D₄ symmetry on retrieval,
+        # giving equivalent data diversity at 1/8th the memory.
         buffer.add_examples(examples)
         path.rename(consumed_dir / path.name)
         ingested += 1
@@ -288,7 +286,9 @@ def main(
     # each iteration, giving stable training dynamics.
     model = GomokuNet()
     model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=learning_rate, weight_decay=1e-4
+    )
 
     # Cosine annealing over the full training run (~10 batches / iteration).
     # T_max spans all batches so the LR reaches 0 at the final step,
@@ -317,7 +317,7 @@ def main(
             temperature=selfplay_temperature,
             temperature_threshold=selfplay_temp_threshold,
             threat_override=True,
-            augment=True,
+            augment=False,
         )
 
         for _ in range(games_per_iteration):
@@ -343,7 +343,6 @@ def main(
         )
 
         save_model_checkpoint(model, latest_path)
-        torch.save(buffer.state_dict(), str(buffer_path))
 
         elapsed = time.monotonic() - iter_start
         print(f"  loss={metrics['loss']:.4f}  "

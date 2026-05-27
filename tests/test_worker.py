@@ -137,8 +137,9 @@ def test_ingest_game_files_loads_into_buffer():
         buf = ReplayBuffer(max_size=1000)
         n = ingest_game_files(buf, game_dir, consumed_dir)
         assert n == 1
-        # 5 examples × 8 D₄ symmetries = 40
-        assert len(buf) == 40
+        # Augmentation is deferred to ReplayBuffer retrieval time,
+        # so the buffer contains exactly the ingested examples (5).
+        assert len(buf) == 5
         assert not path.exists()
         assert (consumed_dir / path.name).exists()
 
@@ -191,7 +192,7 @@ def test_ingest_game_files_caps_consumed():
             torch.save(examples, str(path))
 
         n = ingest_game_files(buf, game_dir, consumed_dir, max_consumed=10)
-        # 12 files × 1 example × 8 symmetries = 96
+        # 12 files × 1 example = 12 (augmentation deferred to retrieval)
         assert n == 12
-        assert len(buf) == 96
+        assert len(buf) == 12
         assert len(list(consumed_dir.glob("game_*.pt"))) == 10

@@ -7,20 +7,34 @@ for feeding a PyTorch ``DataLoader`` or a manual training loop.
 from __future__ import annotations
 
 import random
-from collections import deque
 from typing import Iterator
 
 import torch
 
-from selfplay.selfplay import TrainingExample
+from selfplay.selfplay import SYMMETRIES, TrainingExample
+
+
+def _augment_example(ex: TrainingExample) -> TrainingExample:
+    """Apply one random D₄ symmetry to *ex*, returning a new example.
+
+    The 8-fold augmentation is applied on retrieval (one transform per
+    sample) rather than eagerly on write.  This gives the same effective
+    data diversity at 1/8th the memory.
+    """
+    state_fn, policy_fn = random.choice(SYMMETRIES)
+    policy_grid = ex.policy.view(15, 15)
+    return TrainingExample(
+        state=state_fn(ex.state).clone(),
+        policy=policy_fn(policy_grid).reshape(-1).clone(),
+        value=ex.value,
+    )
 
 
 class ReplayBuffer:
     """Bounded FIFO buffer of self-play training examples.
 
-    New examples displace the oldest ones once *max_size* is reached.
-    Provides O(1) append, O(batch_size) random sampling, and a bulk-loader
-    that returns stacked tensors ready for neural-network training.
+    Newest examples displace the oldest once *max_size* is reached.
+    Uses a plain list for O(1) indexed access during sampling.
 
     Parameters:
         max_size: Maximum number of ``TrainingExample`` entries to retain.
@@ -30,7 +44,7 @@ class ReplayBuffer:
         if max_size < 1:
             raise ValueError("max_size must be positive")
         self.max_size = max_size
-        self._buffer: deque[TrainingExample] = deque(maxlen=max_size)
+        self._buffer: list[TrainingExample] = []
 
     # ------------------------------------------------------------------
     # Mutation
@@ -39,6 +53,8 @@ class ReplayBuffer:
     def add_examples(self, examples: list[TrainingExample]) -> None:
         """Append a batch of examples, evicting the oldest if at capacity."""
         self._buffer.extend(examples)
+        if len(self._buffer) > self.max_size:
+            self._buffer = self._buffer[-self.max_size:]
 
     def clear(self) -> None:
         """Empty the buffer entirely."""
@@ -48,20 +64,30 @@ class ReplayBuffer:
     # Query
     # ------------------------------------------------------------------
 
-    def sample(self, batch_size: int) -> list[TrainingExample]:
+    def sample(
+        self, batch_size: int, *, augment: bool = True
+    ) -> list[TrainingExample]:
         """Return *batch_size* examples chosen uniformly without replacement.
+
+        If *augment* is True (default) each example is randomly transformed
+        by one of the 8 D₄ symmetries, giving 8× effective data diversity
+        without inflating buffer memory.
 
         If the buffer contains fewer than *batch_size* entries the whole
         buffer is returned.
         """
         n = len(self._buffer)
         if batch_size >= n:
-            return list(self._buffer)
-        indices = random.sample(range(n), batch_size)
-        return [self._buffer[i] for i in indices]
+            result = list(self._buffer)
+        else:
+            indices = random.sample(range(n), batch_size)
+            result = [self._buffer[i] for i in indices]
+        if augment:
+            result = [_augment_example(ex) for ex in result]
+        return result
 
     def get_batch(
-        self, batch_size: int
+        self, batch_size: int, *, augment: bool = True
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Sample a batch and return it as ``(states, policies, values)``.
 
@@ -70,7 +96,7 @@ class ReplayBuffer:
             *policies*  ``(batch_size, 225)``
             *values*    ``(batch_size, 1)``
         """
-        examples = self.sample(batch_size)
+        examples = self.sample(batch_size, augment=augment)
         return _collate(examples)
 
     def __len__(self) -> int:
@@ -80,7 +106,7 @@ class ReplayBuffer:
         return iter(self._buffer)
 
     # ------------------------------------------------------------------
-    # Persistence  (lightweight — just saves the raw list of examples)
+    # Persistence
     # ------------------------------------------------------------------
 
     def state_dict(self) -> dict:

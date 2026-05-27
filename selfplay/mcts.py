@@ -81,7 +81,9 @@ class MCTS:
                            ``None`` (default) = no noise.
         dirichlet_epsilon: Mixing proportion: ``(1-ε) · prior + ε · noise``.
         batch_size:        Leaves collected per neural-evaluation batch.
-                           Larger values improve GPU utilisation.
+                           Larger values improve GPU utilisation for
+                           multi-threaded inference but add virtual-loss
+                           overhead in single-threaded MCTS (default: 1).
         evaluator:         Optional ``BatchedLeafEvaluator``.  Created
                            automatically from *wrapper* when not provided.
     """
@@ -92,7 +94,7 @@ class MCTS:
         *,
         c_puct: float = 2.5,
         num_simulations: int = 400,
-        batch_size: int = 32,
+        batch_size: int = 1,
         threat_override: bool = True,
         dirichlet_alpha: Optional[float] = None,
         dirichlet_epsilon: float = 0.25,
@@ -109,7 +111,7 @@ class MCTS:
         self.profiler = profiler or Profiler()
         self.evaluator = evaluator or BatchedLeafEvaluator(
             wrapper,
-            target_batch_size=max(32, batch_size),
+            target_batch_size=batch_size,
             profiler=self.profiler,
         )
 

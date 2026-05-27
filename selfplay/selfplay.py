@@ -119,7 +119,9 @@ class SelfPlayGame:
         threat_override:      When True, MCTS short-circuits on forced
                               wins / blocks.
         augment:              If True, apply D₄ symmetry augmentation to the
-                              output examples (8× data per game).
+                              output examples (8× data per game).  Prefer
+                              ``False`` when writing to a ``ReplayBuffer``
+                              that augments on retrieval instead.
         dirichlet_alpha:      Root Dirichlet noise concentration (default 0.03).
                               ``None`` disables noise.
         dirichlet_epsilon:    Noise mixing proportion (default 0.25).
@@ -134,7 +136,7 @@ class SelfPlayGame:
         temperature: float = 1.0,
         temperature_threshold: int = 15,
         threat_override: bool = True,
-        augment: bool = True,
+        augment: bool = False,
         dirichlet_alpha: float | None = 0.03,
         dirichlet_epsilon: float = 0.25,
     ):

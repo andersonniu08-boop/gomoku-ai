@@ -78,6 +78,9 @@ def run_worker(
     if worker_id == "auto":
         worker_id = f"{socket.gethostname()}-{os.getpid()}"
 
+    # --- Auto-detect device ---
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
     # --- Wait for initial checkpoint ---
     latest_path = checkpoint_dir / "latest.pt"
     waited = 0.0
@@ -90,9 +93,10 @@ def run_worker(
         time.sleep(1.0)
         waited += 1.0
 
-    wrapper = GomokuInferenceWrapper(str(latest_path), device="cpu")
+    wrapper = GomokuInferenceWrapper(str(latest_path), device=device)
     last_mtime = latest_path.stat().st_mtime
-    print(f"[worker {worker_id}] Loaded checkpoint from {latest_path}")
+    last_poll = time.monotonic()
+    print(f"[worker {worker_id}] Loaded checkpoint from {latest_path}  (device={device})")
 
     games_played = 0
     seq = 0
@@ -101,13 +105,16 @@ def run_worker(
         if num_games is not None and games_played >= num_games:
             break
 
-        # --- Reload checkpoint if updated ---
-        if latest_path.exists():
-            cur_mtime = latest_path.stat().st_mtime
-            if cur_mtime > last_mtime:
-                wrapper = GomokuInferenceWrapper(str(latest_path), device="cpu")
-                last_mtime = cur_mtime
-                print(f"[worker {worker_id}] Reloaded updated checkpoint")
+        # --- Reload checkpoint if updated (time-based polling) ---
+        now = time.monotonic()
+        if now - last_poll >= checkpoint_poll_sec:
+            if latest_path.exists():
+                cur_mtime = latest_path.stat().st_mtime
+                if cur_mtime > last_mtime:
+                    wrapper = GomokuInferenceWrapper(str(latest_path), device=device)
+                    last_mtime = cur_mtime
+                    print(f"[worker {worker_id}] Reloaded updated checkpoint")
+            last_poll = now
 
         # --- Play one game ---
         game = SelfPlayGame(

@@ -66,7 +66,7 @@ class BatchedLeafEvaluator:
         self,
         wrapper: GomokuInferenceWrapper,
         *,
-        target_batch_size: int = 64,
+        target_batch_size: int = 1,
         profiler: Optional[Profiler] = None,
     ):
         self.wrapper = wrapper
