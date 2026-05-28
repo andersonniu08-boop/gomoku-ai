@@ -22,10 +22,18 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 app = Flask(__name__, static_folder=None)
 
 # ---------------------------------------------------------------------------
-# Global engine state — loaded once at import time.
+# Global engine state — lazily initialised on first request.
 # ---------------------------------------------------------------------------
 
-wrapper = GomokuInferenceWrapper(str(CHECKPOINT_DIR / "best.pt"))
+_wrapper: GomokuInferenceWrapper | None = None
+
+
+def _get_wrapper() -> GomokuInferenceWrapper:
+    """Lazily load the model — avoids import-time crash on architecture mismatch."""
+    global _wrapper
+    if _wrapper is None:
+        _wrapper = GomokuInferenceWrapper(str(CHECKPOINT_DIR / "best.pt"))
+    return _wrapper
 
 # Strength presets — each configures a dedicated MCTS instance.
 STRENGTH_PRESETS: dict[str, dict] = {
@@ -55,7 +63,7 @@ def _get_mcts(strength: str) -> MCTS:
     if strength not in _mcts_instances:
         params = STRENGTH_PRESETS[strength]
         _mcts_instances[strength] = MCTS(
-            wrapper,
+            _get_wrapper(),
             num_simulations=params["num_simulations"],
             threat_override=True,
         )
