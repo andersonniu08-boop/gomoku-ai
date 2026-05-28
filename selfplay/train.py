@@ -113,6 +113,7 @@ def train_on_examples(
     scheduler: Optional[CosineAnnealingLR] = None,
     device: Optional[str] = None,
     scaler: Optional[torch.amp.GradScaler] = None,
+    max_grad_norm: float = 5.0,
 ) -> dict[str, float]:
     """Train the model for one pass over *examples*.
 
@@ -131,6 +132,7 @@ def train_on_examples(
     total_policy = 0.0
     total_value = 0.0
     total_entropy = 0.0
+    total_grad_norm = 0.0
     num_batches = 0
 
     for i in range(0, len(examples), batch_size):
@@ -160,10 +162,16 @@ def train_on_examples(
         if use_amp:
             scaler.scale(total).backward()
             scaler.unscale_(optimizer)
+            gn = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), max_grad_norm
+            )
             scaler.step(optimizer)
             scaler.update()
         else:
             total.backward()
+            gn = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), max_grad_norm
+            )
             optimizer.step()
         if scheduler is not None:
             scheduler.step()
@@ -172,6 +180,7 @@ def train_on_examples(
         total_policy += policy_loss.item()
         total_value += value_loss.item()
         total_entropy += entropy.item()
+        total_grad_norm += float(gn.item()) if isinstance(gn, torch.Tensor) else float(gn)
         num_batches += 1
 
     n = max(num_batches, 1)
@@ -180,6 +189,7 @@ def train_on_examples(
         "policy_loss": total_policy / n,
         "value_loss": total_value / n,
         "entropy": total_entropy / n,
+        "grad_norm": total_grad_norm / n,
     }
 
 
@@ -250,10 +260,10 @@ def main(
     eval_games: int = 100,
     eval_threshold: float = 0.55,
     mcts_simulations: int = 800,
-    selfplay_temperature: float = 1.0,
-    selfplay_temp_threshold: int = 15,
+    sim_schedule: list[tuple[int, int]] | None = None,
     device: Optional[str] = None,
     game_examples_dir: str | Path = "game_examples/",
+    max_grad_norm: float = 5.0,
 ) -> None:
     """Run the AlphaZero training loop.
 
@@ -342,12 +352,17 @@ def main(
         # 2. Generate fresh self-play games with the LATEST model every
         #    iteration.  This is the core of AlphaZero policy iteration:
         #    improved model → improved search → improved policy targets.
+        current_sims = mcts_simulations
+        if sim_schedule is not None:
+            for start_iter, sims in sorted(sim_schedule, reverse=True):
+                if iteration >= start_iter:
+                    current_sims = sims
+                    break
+
         wrapper = GomokuInferenceWrapper(latest_path, device=device)
         game_runner = SelfPlayGame(
             wrapper,
-            num_simulations=mcts_simulations,
-            temperature=selfplay_temperature,
-            temperature_threshold=selfplay_temp_threshold,
+            num_simulations=current_sims,
             threat_override=True,
             augment=False,
         )
@@ -372,7 +387,7 @@ def main(
 
         metrics = train_on_examples(
             model, optimizer, train_examples, batch_size, scheduler,
-            device=device, scaler=scaler,
+            device=device, scaler=scaler, max_grad_norm=max_grad_norm,
         )
 
         save_model_checkpoint(model, latest_path)
@@ -382,8 +397,10 @@ def main(
               f"policy={metrics['policy_loss']:.4f}  "
               f"value={metrics['value_loss']:.4f}  "
               f"entropy={metrics['entropy']:.4f}  "
+              f"gnorm={metrics['grad_norm']:.2f}  "
               f"lr={scheduler.get_last_lr()[0]:.6f}  "
-              f"buffer={len(buffer)}  "
+              f"buf={len(buffer)}  "
+              f"sims={current_sims}  "
               f"t={elapsed:.1f}s")
 
         # --- Evaluation ---

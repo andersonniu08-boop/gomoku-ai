@@ -212,6 +212,7 @@ def test_selfplay_passes_dirichlet_to_mcts():
         game = SelfPlayGame(wrapper, num_simulations=4)
         assert game.dirichlet_alpha == 0.03
         assert game.dirichlet_epsilon == 0.25
+        assert game.temperature_stages == [(0, 1.0), (15, 0.5), (30, 0.0)]
     finally:
         tmp.unlink()
 

@@ -203,8 +203,7 @@ def test_selfplay_produces_examples():
         game = SelfPlayGame(
             wrapper,
             num_simulations=10,
-            temperature=1.0,
-            temperature_threshold=0,
+            temperature_stages=[(0, 1.0), (1, 0.0)],
             augment=False,
         )
         examples = game.play()
@@ -224,8 +223,7 @@ def test_selfplay_with_augmentation():
         game = SelfPlayGame(
             wrapper,
             num_simulations=10,
-            temperature=1.0,
-            temperature_threshold=0,
+            temperature_stages=[(0, 1.0), (1, 0.0)],
             augment=True,
         )
         examples = game.play()
@@ -239,12 +237,12 @@ def test_selfplay_with_augmentation():
 def test_selfplay_temperature_annealing():
     wrapper, tmp = _make_wrapper()
     try:
-        game = SelfPlayGame(wrapper, temperature=1.0, temperature_threshold=5)
-        # First 5 moves should use temperature 1.0
-        for i in range(5):
+        game = SelfPlayGame(wrapper, temperature_stages=[(0, 1.0), (15, 0.5), (30, 0.0)])
+        for i in range(15):
             assert game._temperature_for_move(i) == 1.0
-        # Move 5 onward should use 0.0
-        assert game._temperature_for_move(5) == 0.0
+        for i in range(15, 30):
+            assert game._temperature_for_move(i) == 0.5
+        assert game._temperature_for_move(30) == 0.0
         assert game._temperature_for_move(100) == 0.0
     finally:
         tmp.unlink()
@@ -257,8 +255,7 @@ def test_selfplay_greedy_game():
         game = SelfPlayGame(
             wrapper,
             num_simulations=10,
-            temperature=1.0,
-            temperature_threshold=0,
+            temperature_stages=[(0, 1.0), (1, 0.0)],
             augment=False,
         )
         examples = game.play()
@@ -409,15 +406,22 @@ def test_selfplay_no_double_search():
     wrapper, tmp = _make_wrapper()
     try:
         original_search = MCTS.search
+        original_search_with_stats = MCTS.search_with_stats
 
-        call_count = 0
+        search_count = 0
 
         def counting_search(self, board):
-            nonlocal call_count
-            call_count += 1
+            nonlocal search_count
+            search_count += 1
             return original_search(self, board)
 
-        with mock.patch.object(MCTS, "search", counting_search):
+        def counting_search_with_stats(self, board):
+            nonlocal search_count
+            search_count += 1
+            return original_search_with_stats(self, board)
+
+        with mock.patch.object(MCTS, "search", counting_search), \
+             mock.patch.object(MCTS, "search_with_stats", counting_search_with_stats):
             game = SelfPlayGame(
                 wrapper,
                 num_simulations=10,
@@ -430,8 +434,8 @@ def test_selfplay_no_double_search():
 
         # One search per move, no extras from select_move.
         num_moves = len(examples)
-        assert call_count == num_moves, (
-            f"MCTS.search() called {call_count}x for {num_moves} moves. "
+        assert search_count == num_moves, (
+            f"MCTS searches called {search_count}x for {num_moves} moves. "
             f"Expected exactly 1 call per move ({num_moves}). "
             f"This means the double-search bug has regressed."
         )

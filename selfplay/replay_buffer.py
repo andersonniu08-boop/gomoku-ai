@@ -45,6 +45,7 @@ class ReplayBuffer:
             raise ValueError("max_size must be positive")
         self.max_size = max_size
         self._buffer: list[TrainingExample] = []
+        self._generation: int = 0
 
     # ------------------------------------------------------------------
     # Mutation
@@ -53,6 +54,7 @@ class ReplayBuffer:
     def add_examples(self, examples: list[TrainingExample]) -> None:
         """Append a batch of examples, evicting the oldest if at capacity."""
         self._buffer.extend(examples)
+        self._generation += 1
         if len(self._buffer) > self.max_size:
             self._buffer = self._buffer[-self.max_size:]
 

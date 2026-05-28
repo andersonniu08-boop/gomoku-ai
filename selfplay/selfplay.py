@@ -148,21 +148,22 @@ class SelfPlayGame:
         *,
         num_simulations: int = 800,
         c_puct: float = 2.5,
-        temperature: float = 1.0,
-        temperature_threshold: int = 15,
+        temperature_stages: list[tuple[int, float]] | None = None,
         threat_override: bool = True,
         augment: bool = False,
         dirichlet_alpha: float | None = 0.03,
         dirichlet_epsilon: float = 0.25,
-        opening_moves: int = 6,
+        opening_moves: int = 8,
         resignation_threshold: float | None = -0.9,
         resignation_moves: int = 3,
     ):
         self.wrapper = wrapper
         self.num_simulations = num_simulations
         self.c_puct = c_puct
-        self.temperature = temperature
-        self.temperature_threshold = temperature_threshold
+        self.temperature_stages = temperature_stages or [
+            (0, 1.0), (15, 0.5), (30, 0.0),
+        ]
+        self._validate_stages()
         self.threat_override = threat_override
         self.augment = augment
         self.dirichlet_alpha = dirichlet_alpha
@@ -170,6 +171,22 @@ class SelfPlayGame:
         self.opening_moves = opening_moves
         self.resignation_threshold = resignation_threshold
         self.resignation_moves = resignation_moves
+
+    def _validate_stages(self) -> None:
+        stages = self.temperature_stages
+        if not stages or stages[0][0] != 0:
+            raise ValueError("temperature_stages must start at move 0")
+        for i in range(1, len(stages)):
+            if stages[i][0] <= stages[i - 1][0]:
+                raise ValueError("temperature_stages must have strictly increasing move indices")
+
+    @property
+    def temperature(self) -> float:
+        return self.temperature_stages[0][1]
+
+    @property
+    def temperature_threshold(self) -> int:
+        return self.temperature_stages[-1][0]
 
     # ------------------------------------------------------------------
     # Public API
@@ -199,44 +216,39 @@ class SelfPlayGame:
             move_num = len(board.move_history)
             temp = self._temperature_for_move(move_num)
 
-            # --- Opening diversity: sample from raw prior, not MCTS ---
-            # For the first *opening_moves* plies the move is drawn from
-            # the network's raw policy prior (temperature ~2) rather than
-            # from MCTS visit counts.  This forces exploration of diverse
-            # opening lines the network considers plausible, preventing
-            # premature convergence to a narrow repertoire.  The raw prior
-            # is also used as the training target for these positions,
-            # which is acceptable because opening positions carry a weak
-            # strategic signal — the game-outcome value target still
-            # provides the primary learning signal.
+            # --- Opening diversity: use MCTS with high temperature ---
             if move_num < self.opening_moves:
                 state, policy, move = self._opening_move(board, mcts)
                 raw.append((state, policy, board.current_player))
                 board.make_move(*move)
                 continue
 
-            visit_probs = mcts.search(board)
+            search_result = mcts.search_with_stats(board)
+            if search_result.total_simulations > 0:
+                visit_probs = {m: c / search_result.total_simulations
+                              for m, c in search_result.visit_counts.items()}
+            elif search_result.visit_counts:
+                visit_probs = {m: 1.0 / len(search_result.visit_counts)
+                              for m in search_result.visit_counts}
+            else:
+                break
 
-            # Encode state *before* the move, from the current player's view.
             state = board_to_tensor(board).squeeze(0)
 
-            # Build a flat 225-element policy target from the visit counts.
             policy = _visit_probs_to_tensor(visit_probs, board_size=15)
+            psum = float(policy.sum())
+            if psum > 0 and abs(psum - 1.0) > 1e-6:
+                policy = policy / psum
 
-            # Record whose turn it is so we can assign the correct value
-            # sign once the game concludes.
             raw.append((state, policy, board.current_player))
 
             move = mcts.select_move(board, temperature=temp, visit_probs=visit_probs)
             board.make_move(*move)
 
-            # --- Resignation check ---
-            # If the root value estimate stays below the resignation
-            # threshold for enough consecutive moves the game is almost
-            # certainly decided — stop early to save compute.  The
-            # already-recorded positions are still valid training data.
-            if self.resignation_threshold is not None and visit_probs:
-                root_value = self._estimate_root_value(visit_probs, mcts, board)
+            # --- Resignation check using tree Q-values ---
+            if self.resignation_threshold is not None and search_result.q_values:
+                root_value = self._estimate_root_value(search_result.q_values,
+                                                       search_result.visit_counts)
                 if root_value < self.resignation_threshold:
                     consecutive_lost += 1
                 else:
@@ -265,86 +277,67 @@ class SelfPlayGame:
     ) -> tuple[torch.Tensor, torch.Tensor, tuple[int, int]]:
         """Return (state_tensor, policy_target, move) for an opening ply.
 
-        The move is sampled from the raw network prior (not MCTS visit
-        counts) with temperature ~2, forcing exploration of diverse
-        lines.  The policy target is the raw prior itself — the network
-        learns to predict its own prior for opening positions, which is
-        acceptable because the game-outcome value target still provides
-        the primary learning signal.
+        Uses MCTS with elevated temperature (2.0) and Dirichlet noise to
+        generate diverse opening exploration while still using full search
+        for policy target quality.  The move is sampled from MCTS visit
+        proportions (not the raw prior), giving richer and more accurate
+        policy targets for training.
         """
-        import torch
+        visit_probs = mcts.search(board)
 
-        from engine.encoding import board_to_tensor
-
-        # Raw network prior.
-        tensor = board_to_tensor(board).to(self.wrapper.device)
-        with torch.no_grad():
-            log_policy, _ = self.wrapper.model(tensor)
-        raw_prior = torch.exp(log_policy).squeeze(0).cpu().numpy()
-
-        # Filter to legal moves.
-        legal = board.get_legal_moves()
-        probs = [float(raw_prior[r * 15 + c]) for (r, c) in legal]
-        total = sum(probs)
-        if total > 0:
-            probs = [p / total for p in probs]
-        else:
-            probs = [1.0 / len(legal)] * len(legal)
-
-        # Sample with temperature ~2 for extra diversity in the opening.
-        temp = 2.0
-        probs_temp = [p ** (1.0 / temp) for p in probs]
-        total_temp = sum(probs_temp)
-        probs_temp = [p / total_temp for p in probs_temp]
-        move = legal[random.choices(range(len(legal)), weights=probs_temp, k=1)[0]]
-
-        # Encode state (same format as main loop).
         state = board_to_tensor(board).squeeze(0).cpu()
+        policy = _visit_probs_to_tensor(visit_probs, board_size=15)
+        psum = float(policy.sum())
+        if psum > 0:
+            policy = policy / psum
 
-        # Use the raw prior as the policy target (no MCTS overhead).
-        policy = torch.zeros(225, dtype=torch.float32)
-        for (r, c), p in zip(legal, probs):
-            policy[r * 15 + c] = p
+        moves = list(visit_probs)
+        temp = 2.0
+        probs_temp = [visit_probs[m] ** (1.0 / temp) for m in moves]
+        total = sum(probs_temp)
+        probs_temp = [p / total for p in probs_temp]
+        move = moves[random.choices(range(len(moves)), weights=probs_temp, k=1)[0]]
 
         return state, policy, move
 
     @staticmethod
     def _estimate_root_value(
-        visit_probs: dict[tuple[int, int], float],
-        mcts: MCTS,
-        board: Board,
+        q_values: dict[tuple[int, int], float],
+        visit_counts: dict[tuple[int, int], int],
     ) -> float:
-        """Estimate the root position value from the perspective of the
-        player who just searched.
+        """Estimate the root position value from the tree's child Q-values.
 
         Uses the visit-weighted average of child Q-values, which is a
-        lower-variance estimate than the raw network value alone.
-        Falls back to a neutral estimate when the tree is empty.
+        lower-variance estimate than the raw network value alone and
+        requires zero additional inference.
         """
-        if not visit_probs:
+        if not visit_counts:
             return 0.0
-        # Reconstruct root Q-values from the MCTS tree.  The search
-        # result only carries visit proportions, but select_move with
-        # temperature > 0 doesn't expose Q.  Approximate via the
-        # evaluator: run a single neural eval as the fallback.
-        tensor = board_to_tensor(board).to(mcts.wrapper.device)
-        with torch.no_grad():
-            _, value = mcts.wrapper.model(tensor)
-        return float(value.item())
+        total = sum(visit_counts.values())
+        if total == 0:
+            return 0.0
+        weighted = sum(q_values[m] * visit_counts[m]
+                       for m in visit_counts
+                       if m in q_values)
+        return weighted / total
 
     def _temperature_for_move(self, move_num: int) -> float:
-        """Return the temperature to use for a given move index.
+        """Return the temperature for a given move index.
 
-        Temperature decays linearly from the configured value to 0 across
-        *temperature_threshold* moves.  This soft annealing is less brittle
-        than the hard cutoff used in the original AlphaZero — it avoids a
-        sudden switch from noisy to deterministic play at a single move
-        boundary, which is especially important for shorter Gomoku games
-        where the transition zone falls in the critical midgame.
+        Uses a stage-based schedule defined by ``temperature_stages``.
+        For move *move_num*, the temperature is the value from the most
+        advanced stage whose ``move_start <= move_num``.  The final stage
+        extends indefinitely.
+
+        Default schedule (3-phase):
+            moves 0-14 → temperature 1.0 (maximum exploration)
+            moves 15-29 → temperature 0.5 (soft greedy)
+            moves 30+ → temperature 0.0 (pure greedy, deterministic)
         """
-        if move_num >= self.temperature_threshold:
-            return 0.0
-        return self.temperature
+        for i in range(len(self.temperature_stages) - 1, -1, -1):
+            if move_num >= self.temperature_stages[i][0]:
+                return self.temperature_stages[i][1]
+        return 0.0
 
 
 # ---------------------------------------------------------------------------

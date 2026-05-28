@@ -41,8 +41,7 @@ def test_worker_writes_valid_game_file():
             output_dir=str(out_dir),
             num_games=1,
             num_simulations=4,
-            temperature=1.0,
-            temperature_threshold=0,
+            temperature_stages=[(0, 0.0)],
             checkpoint_poll_sec=0,
         )
 
@@ -76,8 +75,7 @@ def test_worker_respects_num_games():
             output_dir=str(out_dir),
             num_games=3,
             num_simulations=4,
-            temperature=1.0,
-            temperature_threshold=0,
+            temperature_stages=[(0, 0.0)],
             checkpoint_poll_sec=0,
         )
 
@@ -101,8 +99,7 @@ def test_worker_writes_metadata_sidecar():
             output_dir=str(out_dir),
             num_games=1,
             num_simulations=4,
-            temperature=1.0,
-            temperature_threshold=0,
+            temperature_stages=[(0, 0.0)],
             checkpoint_poll_sec=0,
         )
 

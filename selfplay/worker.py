@@ -49,8 +49,7 @@ def run_worker(
     worker_id: str = "auto",
     num_simulations: int = 800,
     c_puct: float = 2.5,
-    temperature: float = 1.0,
-    temperature_threshold: int = 15,
+    temperature_stages: list[tuple[int, float]] | None = None,
     checkpoint_poll_sec: int = 5,
 ) -> None:
     """Run a self-play worker that writes game files for the trainer.
@@ -121,10 +120,11 @@ def run_worker(
             wrapper,
             num_simulations=num_simulations,
             c_puct=c_puct,
-            temperature=temperature,
-            temperature_threshold=temperature_threshold,
             threat_override=True,
             augment=False,
+            temperature_stages=temperature_stages
+            if temperature_stages is not None
+            else [(0, 1.0), (15, 0.5), (30, 0.0)],
         )
 
         t0 = time.monotonic()
@@ -186,10 +186,8 @@ def _main() -> None:
     p.add_argument("--output-dir", default="game_examples/")
     p.add_argument("--num-games", type=int, default=None)
     p.add_argument("--worker-id", default="auto")
-    p.add_argument("--num-simulations", type=int, default=400)
+    p.add_argument("--num-simulations", type=int, default=800)
     p.add_argument("--c-puct", type=float, default=2.5)
-    p.add_argument("--temperature", type=float, default=1.0)
-    p.add_argument("--temperature-threshold", type=int, default=15)
     p.add_argument("--checkpoint-poll-sec", type=int, default=5)
     args = p.parse_args()
 
@@ -200,8 +198,6 @@ def _main() -> None:
         worker_id=args.worker_id,
         num_simulations=args.num_simulations,
         c_puct=args.c_puct,
-        temperature=args.temperature,
-        temperature_threshold=args.temperature_threshold,
         checkpoint_poll_sec=args.checkpoint_poll_sec,
     )
 
