@@ -129,6 +129,7 @@ def new_game():
     human_player = Player.BLACK if side == "black" else Player.WHITE
     current_strength = strength
     mcts = _get_mcts(strength)
+    mcts.reset_tree()
 
     board = Board()
 

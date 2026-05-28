@@ -148,7 +148,7 @@ def test_benchmark_mcts_speed():
         root = MCTSNode()
 
         start = time.monotonic()
-        mcts._run_search(sim_board, root)
+        mcts._run_search(sim_board, root, mcts.num_simulations)
         elapsed = time.monotonic() - start
 
         total_visits = sum(c.visit_count for c in root.children.values())

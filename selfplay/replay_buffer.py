@@ -99,6 +99,82 @@ class ReplayBuffer:
         examples = self.sample(batch_size, augment=augment)
         return _collate(examples)
 
+    def diversity_stats(self) -> dict:
+        """Return diversity metrics for monitoring training-data quality.
+
+        Computed metrics:
+            *total_positions*    — number of examples in the buffer.
+            *unique_openings*    — distinct opening hashes (first 6 stones).
+            *move_distribution*  — histogram bucketing positions by move
+                                   number (0-9, 10-19, 20-29, 30+).
+            *value_distribution* — counts of win / draw / loss targets.
+            *openings_top*       — 5 most frequent opening hashes and
+                                   their counts (to detect convergence).
+        """
+        from collections import Counter
+
+        n = len(self._buffer)
+        if n == 0:
+            return {
+                "total_positions": 0,
+                "unique_openings": 0,
+                "move_distribution": {},
+                "value_distribution": {"win": 0, "draw": 0, "loss": 0},
+                "openings_top": [],
+            }
+
+        # Opening hash: encode the first 6 stones' relative positions.
+        # We scan the state tensor for non-zero cells; the first 6 found
+        # (in row-major order) form the opening fingerprint.  This is
+        # a rough but fast proxy — two positions that differ only by
+        # symmetry won't match, but symmetry augmentation during
+        # sampling already mixes those.
+        opening_hashes: list[int] = []
+        move_buckets: dict[str, int] = {"0-9": 0, "10-19": 0, "20-29": 0, "30+": 0}
+        value_counts: dict[str, int] = {"win": 0, "draw": 0, "loss": 0}
+
+        for ex in self._buffer:
+            # Opening hash from the first few stones (look at channel 0).
+            stones = (ex.state[0] > 0).nonzero(as_tuple=False)
+            n_stones = min(stones.size(0), 6)
+            h = hash(tuple((int(r), int(c)) for r, c in stones[:n_stones].tolist()))
+            opening_hashes.append(h)
+
+            # Move number: count occupied cells (channels 0 + 1).
+            n_moves = int((ex.state[0].abs() + ex.state[1].abs()).sum().item())
+            if n_moves < 10:
+                move_buckets["0-9"] += 1
+            elif n_moves < 20:
+                move_buckets["10-19"] += 1
+            elif n_moves < 30:
+                move_buckets["20-29"] += 1
+            else:
+                move_buckets["30+"] += 1
+
+            # Value distribution.
+            v = ex.value
+            if v > 0.5:
+                value_counts["win"] += 1
+            elif v < -0.5:
+                value_counts["loss"] += 1
+            else:
+                value_counts["draw"] += 1
+
+        hash_counter = Counter(opening_hashes)
+        unique_openings = len(hash_counter)
+        openings_top = hash_counter.most_common(5)
+
+        return {
+            "total_positions": n,
+            "unique_openings": unique_openings,
+            "opening_diversity_ratio": unique_openings / max(n, 1),
+            "move_distribution": dict(move_buckets),
+            "value_distribution": dict(value_counts),
+            "openings_top": [
+                {"hash": str(h), "count": c} for h, c in openings_top
+            ],
+        }
+
     def __len__(self) -> int:
         return len(self._buffer)
 

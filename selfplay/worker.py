@@ -47,7 +47,7 @@ def run_worker(
     output_dir: str | Path = "game_examples/",
     num_games: int | None = None,
     worker_id: str = "auto",
-    num_simulations: int = 400,
+    num_simulations: int = 800,
     c_puct: float = 2.5,
     temperature: float = 1.0,
     temperature_threshold: int = 15,

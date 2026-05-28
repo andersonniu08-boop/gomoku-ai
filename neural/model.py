@@ -7,17 +7,60 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+# ---------------------------------------------------------------------------
+# Regularisation
+# ---------------------------------------------------------------------------
+
+
+class DropPath(nn.Module):
+    """Stochastic depth (DropPath) regularisation.
+
+    Randomly drops entire residual branches during training, forcing the
+    network to build redundancy across blocks.  At inference all branches
+    are active — the training-time stochasticity acts as a model ensemble.
+
+    Drop probability is typically scheduled linearly from 0 in the first
+    block to *drop_prob* in the last block (Huang et al., 2016).
+    """
+
+    def __init__(self, drop_prob: float = 0.0):
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+        keep_prob = 1.0 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()  # binary mask: 0 (drop) or 1 (keep)
+        return x / keep_prob * random_tensor
+
+    def extra_repr(self) -> str:
+        return f"drop_prob={self.drop_prob:.3f}"
+
+
+# ---------------------------------------------------------------------------
+# Attention modules
+# ---------------------------------------------------------------------------
+
+
 class SELayer(nn.Module):
     """Squeeze-and-Excitation channel attention.
 
     Global avg pool → FC(C → C/r) → ReLU → FC(C/r → C) → Sigmoid.
     Multiplicative gating on the channel dimension.
+
+    The reduction ratio *r* is capped so the bottleneck never drops below
+    8 channels even for modest channel counts (e.g. 128 → bottleneck 16
+    with the default reduction of 8).
     """
 
-    def __init__(self, channels: int, reduction: int = 16):
+    def __init__(self, channels: int, reduction: int = 8):
         super().__init__()
-        self.fc1 = nn.Linear(channels, channels // reduction, bias=False)
-        self.fc2 = nn.Linear(channels // reduction, channels, bias=False)
+        bottleneck = max(8, channels // reduction)
+        self.fc1 = nn.Linear(channels, bottleneck, bias=False)
+        self.fc2 = nn.Linear(bottleneck, channels, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, c, _, _ = x.size()
@@ -30,7 +73,7 @@ class SELayer(nn.Module):
 class SpatialAttention(nn.Module):
     """CBAM-style spatial attention gate.
 
-    Computes a 2D attention map by pooling across channels (avg + max),
+    Computes a 2-D attention map by pooling across channels (avg + max),
     convolving the stacked (2, H, W) descriptor with a small kernel, and
     applying sigmoid.  The resulting (1, H, W) map is broadcast-multiplied
     with the input to suppress irrelevant spatial regions.
@@ -47,27 +90,34 @@ class SpatialAttention(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        avg = x.mean(dim=1, keepdim=True)       # (B, 1, H, W)
-        mx = x.max(dim=1, keepdim=True)[0]      # (B, 1, H, W)
-        pooled = torch.cat([avg, mx], dim=1)    # (B, 2, H, W)
-        attn = torch.sigmoid(self.conv(pooled)) # (B, 1, H, W)
+        avg = x.mean(dim=1, keepdim=True)
+        mx = x.max(dim=1, keepdim=True)[0]
+        pooled = torch.cat([avg, mx], dim=1)
+        attn = torch.sigmoid(self.conv(pooled))
         return x * attn
 
 
 class AttentionAugmentedConv(nn.Module):
-    """Lightweight multi-head self-attention over the spatial grid.
+    """Multi-head self-attention over the spatial grid.
 
     Runs in parallel with the conv branch inside a residual block,
     providing global pairwise position interactions to complement
     local convolution features.
+
+    A pre-attention LayerNorm stabilises training and removes the
+    dependency on the caller providing normalised inputs.
     """
 
-    def __init__(self, channels: int, num_heads: int = 1):
+    def __init__(self, channels: int, num_heads: int = 4):
         super().__init__()
+        assert channels % num_heads == 0, (
+            f"channels ({channels}) must be divisible by num_heads ({num_heads})"
+        )
         self.num_heads = num_heads
         self.head_dim = channels // num_heads
         self.scale = self.head_dim ** -0.5
 
+        self.norm = nn.LayerNorm(channels)
         self.qkv = nn.Linear(channels, channels * 3, bias=False)
         self.out_proj = nn.Linear(channels, channels, bias=False)
 
@@ -76,7 +126,8 @@ class AttentionAugmentedConv(nn.Module):
         # (B, C, H, W) → (B, H*W, C)
         x_flat = x.view(b, c, h * w).transpose(1, 2)
 
-        qkv = self.qkv(x_flat)
+        x_norm = self.norm(x_flat)
+        qkv = self.qkv(x_norm)
         q, k, v = qkv.chunk(3, dim=-1)
 
         # (B, H*W, C) → (B, H*W, heads, head_dim) → (B, heads, H*W, head_dim)
@@ -95,6 +146,11 @@ class AttentionAugmentedConv(nn.Module):
         return out
 
 
+# ---------------------------------------------------------------------------
+# Residual blocks
+# ---------------------------------------------------------------------------
+
+
 class SEResidualBlock(nn.Module):
     """Residual block with optional SE, spatial attention, and self-attention.
 
@@ -102,6 +158,7 @@ class SEResidualBlock(nn.Module):
     Attention path: self-attention over spatial grid on input (optional)
     SE:             channel gating after conv+attention merge (optional)
     Spatial:        CBAM spatial attention after SE (optional)
+    DropPath:       stochastic depth on the residual branch (optional)
     Skip:           input added to merged result, then ReLU
 
     Dilation support expands the receptive field in later blocks
@@ -115,9 +172,10 @@ class SEResidualBlock(nn.Module):
         use_se: bool = True,
         use_attention: bool = True,
         use_spatial: bool = True,
-        se_reduction: int = 16,
-        num_attention_heads: int = 1,
+        se_reduction: int = 8,
+        num_attention_heads: int = 4,
         dilation: int = 1,
+        drop_path: float = 0.0,
     ):
         super().__init__()
         self.use_se = use_se
@@ -141,6 +199,8 @@ class SEResidualBlock(nn.Module):
             self.attn = AttentionAugmentedConv(channels, num_heads=num_attention_heads)
         if use_spatial:
             self.spatial = SpatialAttention(kernel_size=3)
+
+        self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
@@ -157,6 +217,7 @@ class SEResidualBlock(nn.Module):
         if self.use_spatial:
             out = self.spatial(out)
 
+        out = self.drop_path(out)
         out = out + residual
         return F.relu(out)
 
@@ -165,7 +226,8 @@ class PreActSEResidualBlock(nn.Module):
     """Pre-activation (ResNet-v2) residual block with optional SE, spatial,
     and self-attention.
 
-    BN → ReLU → Conv3×3 → BN → ReLU → Conv3×3 → (+ Attn) → (SE) → (Spatial) → + skip
+    BN → ReLU → Conv3×3 → BN → ReLU → Conv3×3 → (+ Attn on preact) →
+    (SE) → (Spatial) → DropPath → + skip
 
     Pre-activation places BN → ReLU before convolutions rather than after,
     improving gradient flow for deeper networks (He et al., 2016).
@@ -177,9 +239,10 @@ class PreActSEResidualBlock(nn.Module):
         use_se: bool = True,
         use_attention: bool = True,
         use_spatial: bool = True,
-        se_reduction: int = 16,
-        num_attention_heads: int = 1,
+        se_reduction: int = 8,
+        num_attention_heads: int = 4,
         dilation: int = 1,
+        drop_path: float = 0.0,
     ):
         super().__init__()
         self.use_se = use_se
@@ -203,6 +266,8 @@ class PreActSEResidualBlock(nn.Module):
             self.attn = AttentionAugmentedConv(channels, num_heads=num_attention_heads)
         if use_spatial:
             self.spatial = SpatialAttention(kernel_size=3)
+
+        self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
@@ -221,10 +286,14 @@ class PreActSEResidualBlock(nn.Module):
         if self.use_spatial:
             out = self.spatial(out)
 
+        out = self.drop_path(out)
         return out + residual  # no final ReLU — absorbed by next block's BN → ReLU
 
 
 class ResidualBlock(nn.Module):
+    """Plain residual block (no attention, no SE) — kept for compatibility
+    with lightweight test fixtures."""
+
     def __init__(self, channels: int, dilation: int = 1):
         super().__init__()
         self.conv1 = nn.Conv2d(
@@ -246,25 +315,67 @@ class ResidualBlock(nn.Module):
         return F.relu(out)
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_dilation_schedule(num_blocks: int) -> list[int]:
+    """Multi-scale pyramid dilation schedule.
+
+    Ramps from local (dilation 1) through medium (2) to long-range (3)
+    and back down, giving the network access to features at three
+    spatial scales rather than just two.
+
+    For the default 10 blocks: ``[1, 1, 1, 2, 2, 3, 3, 2, 2, 1]``.
+    """
+    if num_blocks <= 3:
+        return [1] * num_blocks
+
+    n_local1 = max(1, round(num_blocks * 0.30))
+    n_dil2_up = max(1, round(num_blocks * 0.20))
+    n_dil3 = max(1, round(num_blocks * 0.20))
+    n_dil2_down = max(1, round(num_blocks * 0.15))
+    n_local2 = num_blocks - n_local1 - n_dil2_up - n_dil3 - n_dil2_down
+
+    if n_local2 < 1:
+        # Not enough blocks for full pyramid → two-phase fallback.
+        n_dil2 = max(1, round(num_blocks * 0.3))
+        return [1] * (num_blocks - n_dil2) + [2] * n_dil2
+
+    return [1] * n_local1 + [2] * n_dil2_up + [3] * n_dil3 + [2] * n_dil2_down + [1] * n_local2
+
+
+# ---------------------------------------------------------------------------
+# Main network
+# ---------------------------------------------------------------------------
+
+
 class GomokuNet(nn.Module):
     """Dual-headed CNN for 15×15 Gomoku.
 
     Policy head  → log-softmax over 225 cells.
     Value head   → tanh  scalar in [-1, 1].
 
-    Architecture highlights:
+    Architecture highlights (v2):
 
-    * **Multi-head self-attention** (default 2 heads) complements local
+    * **Multi-head self-attention** (default 4 heads) complements local
       convolutions with global pairwise position interactions, helping
-      detect disjoint threats across the board.
-    * **Dilated convolutions** in later residual blocks expand the
-      receptive field without extra parameters, critical for spotting
-      five-in-a-row patterns that span 5+ cells.
+      detect disjoint threats across the board.  A pre-attention
+      LayerNorm stabilises the QKV projections.
+    * **Multi-scale dilated convolutions** follow a pyramid schedule
+      (1 → 2 → 3 → 2 → 1), giving the trunk access to local, medium,
+      and long-range features at different depths.
     * **CBAM spatial attention** after SE channel gating gives each
       block a lightweight "where" signal alongside the "what" signal.
-    * **Deeper policy head** with a 3×3 convolution stage before the
-      1×1 projection gives the policy sufficient capacity to transform
-      shared features into move-specific evidence.
+    * **Fully convolutional policy head** projects trunk features to a
+      single-channel logit map via 3×3 → 1×1 convolutions, preserving
+      spatial structure without a costly FC layer.
+    * **Dual-pooling value head** concatenates global average and max
+      poolings over the full 128-channel feature map, giving the value
+      head access to rich spatial statistics without a 1×1 bottleneck.
+    * **Stochastic depth (DropPath)** regularises the residual trunk
+      during training, acting as an implicit model ensemble.
     """
 
     def __init__(
@@ -276,12 +387,12 @@ class GomokuNet(nn.Module):
         use_se: bool = True,
         use_attention: bool = True,
         use_pre_activation: bool = False,
-        value_global_pool: bool = True,
-        se_reduction: int = 16,
-        num_attention_heads: int = 2,
+        se_reduction: int = 8,
+        num_attention_heads: int = 4,
         use_spatial: bool = True,
         dilations: list[int] | None = None,
         policy_hidden_channels: int = 32,
+        drop_path_rate: float = 0.1,
     ):
         super().__init__()
         self.board_size = board_size
@@ -289,12 +400,7 @@ class GomokuNet(nn.Module):
 
         # --- dilation schedule ---
         if dilations is None:
-            # First ~70 % of blocks at dilation 1 (local pattern
-            # refinement), remaining blocks at dilation 2 (long-range
-            # line detection).  For the default 10 blocks this gives
-            # [1,1,1,1,1,1,1, 2,2,2].
-            n_late = max(0, num_res_blocks - 7)
-            dilations = [1] * (num_res_blocks - n_late) + [2] * n_late
+            dilations = _make_dilation_schedule(num_res_blocks)
 
         if len(dilations) != num_res_blocks:
             raise ValueError(
@@ -305,6 +411,14 @@ class GomokuNet(nn.Module):
         block_cls = (
             PreActSEResidualBlock if use_pre_activation else SEResidualBlock
         )
+
+        # Linear DropPath schedule: 0 in the first block, *drop_path_rate*
+        # in the last.  Early blocks learn reliable low-level features;
+        # later blocks are regularised more aggressively.
+        drop_path_rates = [
+            drop_path_rate * i / max(num_res_blocks - 1, 1)
+            for i in range(num_res_blocks)
+        ]
 
         self.conv_init = nn.Conv2d(
             in_channels, num_hidden_channels, kernel_size=3, padding=1, bias=False
@@ -320,59 +434,50 @@ class GomokuNet(nn.Module):
                     se_reduction=se_reduction,
                     num_attention_heads=num_attention_heads,
                     dilation=dilations[i],
+                    drop_path=drop_path_rates[i],
                 )
                 for i in range(num_res_blocks)
             ]
         )
 
-        # --- Policy head (deeper) ---
-        # 3×3 conv → BN → ReLU  extracts local move-relevant features
-        # 1×1 conv → BN → ReLU  compresses to 2 channels for the FC layer
+        # --- Policy head (fully convolutional) ---
+        # 3×3 conv → BN → ReLU extracts local move-relevant features from
+        # the trunk output.  A 1×1 conv then projects to a single-channel
+        # logit map, preserving spatial correspondence — each of the 225
+        # output logits depends on the corresponding trunk feature column.
         self.policy_conv1 = nn.Conv2d(
             num_hidden_channels, policy_hidden_channels, kernel_size=3,
             padding=1, bias=False,
         )
         self.policy_bn1 = nn.BatchNorm2d(policy_hidden_channels)
         self.policy_conv2 = nn.Conv2d(
-            policy_hidden_channels, 2, kernel_size=1, bias=False,
+            policy_hidden_channels, 1, kernel_size=1, bias=True,
         )
-        self.policy_bn2 = nn.BatchNorm2d(2)
-        self.policy_fc = nn.Linear(2 * board_size * board_size, action_space)
 
-        # --- Value head ---
-        self.value_global_pool = value_global_pool
-        self.value_conv = nn.Conv2d(num_hidden_channels, 1, kernel_size=1, bias=False)
-        self.value_bn = nn.BatchNorm2d(1)
-        self.value_fc1 = nn.Linear(board_size * board_size, num_hidden_channels)
-        if value_global_pool:
-            self.value_avg_fc = nn.Linear(num_hidden_channels, num_hidden_channels)
-            self.value_max_fc = nn.Linear(num_hidden_channels, num_hidden_channels)
-        self.value_fc2 = nn.Linear(num_hidden_channels, 1)
+        # --- Value head (dual global pooling) ---
+        # Concatenates global average and max poolings over the full
+        # 128-channel feature map, avoiding the information bottleneck
+        # of a 1×1 conv-to-1-channel projection.  Two FC layers map the
+        # 2C pooled descriptor to a scalar.
+        self.value_fc1 = nn.Linear(num_hidden_channels * 2, 64)
+        self.value_fc2 = nn.Linear(64, 1)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         x = F.relu(self.bn_init(self.conv_init(x)))
         for block in self.res_blocks:
             x = block(x)
 
-        # Policy: 3×3 → BN → ReLU → 1×1 → BN → ReLU → FC → log-softmax
+        # Policy: 3×3 → BN → ReLU → 1×1 → flatten → log-softmax
         p = F.relu(self.policy_bn1(self.policy_conv1(x)))
-        p = F.relu(self.policy_bn2(self.policy_conv2(p)))
-        p = p.view(p.size(0), -1)
-        log_policy = F.log_softmax(self.policy_fc(p), dim=1)
+        p = self.policy_conv2(p)          # (B, 1, 15, 15)
+        p = p.view(p.size(0), -1)         # (B, 225)
+        log_policy = F.log_softmax(p, dim=1)
 
-        # Value: tanh → [-1, 1]
-        v = F.relu(self.value_bn(self.value_conv(x)))
-        v = v.view(v.size(0), -1)
+        # Value: dual global pooling → FC → ReLU → FC → tanh
+        avg_pool = x.mean(dim=[2, 3])                     # (B, C)
+        max_pool = x.max(dim=3)[0].max(dim=2)[0]          # (B, C)
+        v = torch.cat([avg_pool, max_pool], dim=1)        # (B, 2C)
         v = F.relu(self.value_fc1(v))
-
-        if self.value_global_pool:
-            # Global context branches operating on the full feature maps.
-            avg_pool = x.mean(dim=[2, 3])        # (B, C)
-            max_pool = x.max(dim=3)[0].max(dim=2)[0]  # (B, C)
-            global_feat = F.relu(self.value_avg_fc(avg_pool)) + \
-                          F.relu(self.value_max_fc(max_pool))
-            v = v + global_feat
-
         value = torch.tanh(self.value_fc2(v))
 
         return log_policy, value

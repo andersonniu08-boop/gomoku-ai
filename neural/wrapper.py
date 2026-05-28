@@ -27,7 +27,6 @@ class GomokuInferenceWrapper:
         use_se: bool = True,
         use_attention: bool = True,
         use_pre_activation: bool = False,
-        value_global_pool: bool = True,
         profiler: Optional[Profiler] = None,
     ):
         if device is None:
@@ -50,7 +49,6 @@ class GomokuInferenceWrapper:
             use_se=use_se,
             use_attention=use_attention,
             use_pre_activation=use_pre_activation,
-            value_global_pool=value_global_pool,
         ).to(self.device)
 
         checkpoint = torch.load(

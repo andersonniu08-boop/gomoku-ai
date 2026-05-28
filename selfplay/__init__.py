@@ -1,3 +1,4 @@
+from .config import BUILTIN_PRESETS, StrengthConfig, get_preset
 from .evaluator import BatchedLeafEvaluator, EvaluationResult
 from .mcts import MCTS, MCTSNode, SearchResult
 from .selfplay import SYMMETRIES, SelfPlayGame, TrainingExample, augment_examples

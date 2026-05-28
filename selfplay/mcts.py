@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import random
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -71,21 +72,41 @@ class MCTS:
     Uses a single *virtual board* that is mutated during selection and
     restored during back-propagation, avoiding per-node board copies.
 
+    The search can be bounded in two ways (mutually exclusive):
+
+    1. **Fixed simulations** — ``num_simulations`` iterations, regardless
+       of wall-clock time.
+    2. **Time budget** — ``time_budget_ms`` milliseconds of wall-clock
+       time (ignores ``num_simulations``).
+
+    When neither is explicitly provided, the default is 800 simulations.
+
     Parameters:
         wrapper:           Trained ``GomokuInferenceWrapper``.
         c_puct:            Exploration constant for the PUCT formula.
-        num_simulations:   MCTS iterations per search.
+        num_simulations:   MCTS iterations per search (default: 800).
+                           Ignored when *time_budget_ms* is set.
+        time_budget_ms:    Optional wall-clock budget in milliseconds.
+                           When set, the search runs as many simulations
+                           as fit within this time window.
+        batch_size:        Leaves collected per neural-evaluation batch.
+                           Larger values improve GPU utilisation for
+                           multi-threaded inference but add virtual-loss
+                           overhead in single-threaded MCTS (default: 1).
         threat_override:   When True, use ``ThreatDetector`` to short-circuit
                            search on immediate wins / must-block threats.
         dirichlet_alpha:   Concentration parameter for root Dirichlet noise.
                            ``None`` (default) = no noise.
         dirichlet_epsilon: Mixing proportion: ``(1-ε) · prior + ε · noise``.
-        batch_size:        Leaves collected per neural-evaluation batch.
-                           Larger values improve GPU utilisation for
-                           multi-threaded inference but add virtual-loss
-                           overhead in single-threaded MCTS (default: 1).
+        profiler:          Optional ``Profiler`` for detailed timing breakdown.
         evaluator:         Optional ``BatchedLeafEvaluator``.  Created
                            automatically from *wrapper* when not provided.
+        tree_reuse:        When True (default), the search tree from a
+                           previous search is re-rooted and reused so
+                           simulation effort accumulates across moves.
+                           Disable for self-play training and model
+                           evaluation where each position needs an
+                           independent, identically-budgeted search.
     """
 
     def __init__(
@@ -93,21 +114,25 @@ class MCTS:
         wrapper: GomokuInferenceWrapper,
         *,
         c_puct: float = 2.5,
-        num_simulations: int = 400,
+        num_simulations: int = 800,
+        time_budget_ms: float | None = None,
         batch_size: int = 1,
         threat_override: bool = True,
-        dirichlet_alpha: Optional[float] = None,
+        dirichlet_alpha: float | None = None,
         dirichlet_epsilon: float = 0.25,
-        profiler: Optional[Profiler] = None,
-        evaluator: Optional[BatchedLeafEvaluator] = None,
+        tree_reuse: bool = True,
+        profiler: Profiler | None = None,
+        evaluator: BatchedLeafEvaluator | None = None,
     ):
         self.wrapper = wrapper
         self.c_puct = c_puct
         self.num_simulations = num_simulations
+        self.time_budget_ms = time_budget_ms
         self.batch_size = batch_size
         self.threat_override = threat_override
         self.dirichlet_alpha = dirichlet_alpha
         self.dirichlet_epsilon = dirichlet_epsilon
+        self.tree_reuse = tree_reuse
         self.profiler = profiler or Profiler()
         self.evaluator = evaluator or BatchedLeafEvaluator(
             wrapper,
@@ -115,15 +140,30 @@ class MCTS:
             profiler=self.profiler,
         )
 
+        self._prev_root: Optional[MCTSNode] = None
+        self._prev_board: Optional[Board] = None
+        self._cumulative_sims: int = 0
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def reset_tree(self) -> None:
+        """Discard any cached search tree (e.g. on new game)."""
+        self._prev_root = None
+        self._prev_board = None
+        self._cumulative_sims = 0
 
     def search(self, board: Board) -> dict[tuple[int, int], float]:
         """Run batched MCTS from *board*.
 
         Descends *batch_size* leaves in parallel (using virtual loss to
         diversify paths), evaluates them with one GPU call, then backs up.
+
+        When a previous search tree exists and the board's new moves can
+        be matched to children of that tree, the subtree is reused —
+        preserving prior simulation statistics for dramatically improved
+        effective search depth.
 
         Returns a probability distribution over legal moves.
         """
@@ -137,12 +177,23 @@ class MCTS:
             with self.profiler.measure("threat_check"):
                 forced = self._check_forced(board)
             if forced is not None:
+                self._prev_root = None
+                self._prev_board = None
                 return forced
 
         sim_board = board.copy()
-        root = MCTSNode()
+        root, is_reused = self._try_reroot(board)
+        fresh_sims = self._sim_budget()
         with self.profiler.measure("search.total"):
-            self._run_search(sim_board, root)
+            self._run_search(sim_board, root, fresh_sims, is_reused=is_reused)
+
+        if self.tree_reuse:
+            self._prev_root = root
+            self._prev_board = board.copy()
+        if is_reused:
+            self._cumulative_sims += fresh_sims
+        else:
+            self._cumulative_sims = fresh_sims
 
         total_visits = sum(c.visit_count for c in root.children.values())
         if total_visits == 0:
@@ -155,7 +206,8 @@ class MCTS:
 
         Uses the same internal search loop as :meth:`search` but exposes
         root children's full statistics (visit counts, Q values, priors)
-        instead of just visit proportions.
+        instead of just visit proportions.  Also benefits from tree reuse
+        when a prior search tree is available.
         """
         if board.is_terminal():
             return SearchResult({}, {}, {}, 0)
@@ -166,6 +218,8 @@ class MCTS:
             with self.profiler.measure("threat_check"):
                 forced = self._check_forced(board)
             if forced is not None:
+                self._prev_root = None
+                self._prev_board = None
                 moves = list(forced)
                 visit_counts = {m: 1 for m in moves}
                 q_values = {m: 0.0 for m in moves}
@@ -173,14 +227,23 @@ class MCTS:
                 return SearchResult(visit_counts, q_values, priors, 0)
 
         sim_board = board.copy()
-        root = MCTSNode()
+        root, is_reused = self._try_reroot(board)
+        fresh_sims = self._sim_budget()
         with self.profiler.measure("search.total"):
-            self._run_search(sim_board, root)
+            self._run_search(sim_board, root, fresh_sims, is_reused=is_reused)
+
+        if self.tree_reuse:
+            self._prev_root = root
+            self._prev_board = board.copy()
+        if is_reused:
+            self._cumulative_sims += fresh_sims
+        else:
+            self._cumulative_sims = fresh_sims
 
         visit_counts = {m: c.visit_count for m, c in root.children.items()}
         q_values = {m: c.q for m, c in root.children.items()}
         priors = {m: c.prior for m, c in root.children.items()}
-        return SearchResult(visit_counts, q_values, priors, self.num_simulations)
+        return SearchResult(visit_counts, q_values, priors, self._cumulative_sims)
 
     def select_move(
         self,
@@ -212,22 +275,110 @@ class MCTS:
         return moves[random.choices(range(len(moves)), weights=probs, k=1)[0]]
 
     # ------------------------------------------------------------------
+    # Tree reuse
+    # ------------------------------------------------------------------
+
+    def _try_reroot(self, board: Board) -> tuple[MCTSNode, bool]:
+        """Attempt to re-root the previous search tree at *board*.
+
+        Compares *board*'s ``move_history`` against the stored previous
+        board to discover which moves were played between searches.
+        Walks the tree along those moves, returning the new root and
+        ``is_reused=True``.  If any move is missing from the tree — or
+        if no prior tree exists — returns a fresh ``MCTSNode`` and
+        ``is_reused=False``.
+
+        Returns ``(root, is_reused)``.
+        """
+        if not self.tree_reuse:
+            return MCTSNode(), False
+
+        if self._prev_root is None or self._prev_board is None:
+            return MCTSNode(), False
+
+        prev_moves = self._prev_board.move_history
+        curr_moves = board.move_history
+
+        # If the board was reset or moves were undone, fall back.
+        if len(curr_moves) < len(prev_moves):
+            return MCTSNode(), False
+
+        new_moves = curr_moves[len(prev_moves):]
+        if not new_moves:
+            # Same board — just reuse the existing root.
+            return self._prev_root, True
+
+        root = self._prev_root
+        for move in new_moves:
+            if move not in root.children:
+                return MCTSNode(), False
+            root = root.children[move]
+
+        return root, True
+
+    def _sim_budget(self) -> int:
+        """Return the number of fresh simulations to run this search.
+
+        In fixed-budget mode this is ``num_simulations``.  In time-budget
+        mode we return a large sentinel — the search loop exits on wall
+        clock instead.
+        """
+        if self.time_budget_ms is not None:
+            return 1_000_000_000  # effectively unbounded; time-budget stops it
+        return self.num_simulations
+
+    # ------------------------------------------------------------------
     # Search loop (shared by search() and search_with_stats())
     # ------------------------------------------------------------------
 
-    def _run_search(self, sim_board: Board, root: MCTSNode) -> None:
+    def _run_search(
+        self,
+        sim_board: Board,
+        root: MCTSNode,
+        fresh_sims: int,
+        *,
+        is_reused: bool = False,
+    ) -> None:
         """Run the main MCTS loop, populating *root* with visited statistics.
 
         Mutates *sim_board* during descent and restores it after each batch
         of descents.  *root* is expanded and its children accumulate visit
         counts, total values, and virtual loss markers.
 
-        Call this from :meth:`search` and :meth:`search_with_stats` after
-        creating a fresh copy of the board and an empty root node.
+        When *is_reused* is True the root was obtained via tree reuse —
+        Dirichlet noise is skipped (priors were already mixed in a prior
+        search) and the existing subtree statistics provide a warm start.
+
+        The loop terminates either when *fresh_sims* simulations have run
+        (fixed-budget mode) or when ``time_budget_ms`` wall-clock time
+        has elapsed (time-budget mode).  When both are set, time budget
+        takes precedence.
         """
         sims_done = 0
-        while sims_done < self.num_simulations:
-            n = min(self.batch_size, self.num_simulations - sims_done)
+        use_time_budget = self.time_budget_ms is not None
+        deadline = None
+        if use_time_budget:
+            deadline = time.monotonic() + self.time_budget_ms / 1000.0
+
+        while True:
+            # --- Check termination ---
+            if use_time_budget:
+                if time.monotonic() >= deadline:
+                    break
+                # Compute how many sims we can attempt this batch without
+                # blowing the budget.  Use at least 1.
+                remaining_s = deadline - time.monotonic()
+                if remaining_s <= 0:
+                    break
+            else:
+                if sims_done >= fresh_sims:
+                    break
+
+            # --- Batch size ---
+            if use_time_budget:
+                n = self.batch_size
+            else:
+                n = min(self.batch_size, fresh_sims - sims_done)
 
             with self.profiler.measure("search.batch"):
                 # ---- descend n times, collecting leaves ----
@@ -304,8 +455,11 @@ class MCTS:
                                 current_value = -current_value
 
                 # ---- inject Dirichlet noise at root after first expansion ----
+                # Only apply to freshly-created roots.  Reused trees already
+                # have priors mixed from a prior search.
                 if (
-                    self.dirichlet_alpha is not None
+                    not is_reused
+                    and self.dirichlet_alpha is not None
                     and root.children
                     and sims_done == 0
                 ):

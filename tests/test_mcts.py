@@ -373,3 +373,213 @@ def test_mcts_threat_override_with_full_legality():
         assert set(dist.keys()) == {(7, 1), (7, 6)}
     finally:
         tmp.unlink()
+
+
+# ---------------------------------------------------------------------------
+# Tree reuse tests
+# ---------------------------------------------------------------------------
+
+
+def test_tree_reuse_reroot_after_single_move():
+    """After searching and playing the top move, the tree re-roots at that child."""
+    wrapper, tmp = _make_wrapper()
+    try:
+        mcts = MCTS(wrapper, num_simulations=30, threat_override=False)
+        board = Board()
+        board.make_move(7, 7)
+        board.make_move(8, 8)
+
+        # First search.
+        result1 = mcts.search_with_stats(board)
+        top_move = max(result1.visit_counts, key=result1.visit_counts.get)
+        prev_root = mcts._prev_root
+        assert prev_root is not None
+        assert top_move in prev_root.children
+
+        # Play the top move.
+        board.make_move(*top_move)
+
+        # Second search should re-root.
+        result2 = mcts.search_with_stats(board)
+        # The new root should be the child we re-rooted to.
+        assert mcts._prev_root is not None
+        # Cumulative sims should be > num_simulations.
+        assert result2.total_simulations >= 30
+    finally:
+        tmp.unlink()
+
+
+def test_tree_reuse_reroot_through_multiple_moves():
+    """Tree re-roots correctly through two moves (AI then human response)."""
+    wrapper, tmp = _make_wrapper()
+    try:
+        mcts = MCTS(wrapper, num_simulations=40, threat_override=False)
+        board = Board()
+        board.make_move(7, 7)
+        board.make_move(8, 8)
+
+        # First search.
+        result1 = mcts.search_with_stats(board)
+        ai_move = max(result1.visit_counts, key=result1.visit_counts.get)
+        board.make_move(*ai_move)
+
+        # Second search (human response).
+        result2 = mcts.search_with_stats(board)
+        assert len(result2.visit_counts) > 0
+        human_move = max(result2.visit_counts, key=result2.visit_counts.get)
+        board.make_move(*human_move)
+
+        # Third search — should re-root through both moves.
+        result3 = mcts.search_with_stats(board)
+        assert len(result3.visit_counts) > 0
+        assert result3.total_simulations >= 40
+    finally:
+        tmp.unlink()
+
+
+def test_tree_reuse_fallback_on_unknown_move():
+    """When the opponent plays a move not in the tree, fall back to fresh root."""
+    wrapper, tmp = _make_wrapper()
+    try:
+        mcts = MCTS(wrapper, num_simulations=30, threat_override=False)
+        board = Board()
+        board.make_move(7, 7)
+        board.make_move(8, 8)
+
+        # First search.
+        mcts.search_with_stats(board)
+        assert mcts._prev_root is not None
+
+        # Play a move NOT in the tree — pick a corner far from action.
+        board.make_move(0, 0)
+
+        # Second search should fall back to fresh root.
+        result2 = mcts.search_with_stats(board)
+        assert len(result2.visit_counts) > 0
+        # Cumulative sims should be 30 (fresh search), not 60.
+        assert result2.total_simulations == 30
+    finally:
+        tmp.unlink()
+
+
+def test_tree_reuse_fallback_on_board_reset():
+    """When the board is reset (fewer moves), fall back to fresh tree."""
+    wrapper, tmp = _make_wrapper()
+    try:
+        mcts = MCTS(wrapper, num_simulations=20, threat_override=False)
+        board = Board()
+        board.make_move(7, 7)
+
+        mcts.search_with_stats(board)
+        assert mcts._prev_root is not None
+
+        # Create a fresh board with fewer moves — simulates new game.
+        board2 = Board()
+        result2 = mcts.search_with_stats(board2)
+        assert len(result2.visit_counts) > 0
+        assert result2.total_simulations == 20
+    finally:
+        tmp.unlink()
+
+
+def test_tree_reuse_reset_tree_method():
+    """reset_tree() clears all cached state."""
+    wrapper, tmp = _make_wrapper()
+    try:
+        mcts = MCTS(wrapper, num_simulations=20, threat_override=False)
+        board = Board()
+        board.make_move(7, 7)
+
+        mcts.search_with_stats(board)
+        assert mcts._prev_root is not None
+        assert mcts._prev_board is not None
+
+        mcts.reset_tree()
+        assert mcts._prev_root is None
+        assert mcts._prev_board is None
+        assert mcts._cumulative_sims == 0
+    finally:
+        tmp.unlink()
+
+
+def test_tree_reuse_threat_override_clears_tree():
+    """When threat override fires, the cached tree is cleared."""
+    wrapper, tmp = _make_wrapper()
+    try:
+        mcts = MCTS(wrapper, num_simulations=10, threat_override=True)
+        board = Board()
+
+        # First search on a neutral position — tree should be stored.
+        board.make_move(7, 7)
+        board.make_move(8, 8)
+        mcts.search(board)
+        assert mcts._prev_root is not None
+
+        # Set up an immediate win — threat override fires, tree cleared.
+        board.make_move(7, 2)
+        board.make_move(8, 3)
+        board.make_move(7, 3)
+        board.make_move(8, 4)
+        board.make_move(7, 4)
+        board.make_move(8, 5)
+        board.make_move(7, 5)  # Black has open four
+        board.make_move(8, 6)
+        # Black to move with open four at (7,2)-(7,5).
+        mcts.search(board)
+        # Tree should be cleared because threat override fired.
+        assert mcts._prev_root is None
+    finally:
+        tmp.unlink()
+
+
+def test_tree_reuse_preserves_subtree_statistics():
+    """After re-root, child visit counts from prior search are preserved."""
+    wrapper, tmp = _make_wrapper()
+    try:
+        mcts = MCTS(wrapper, num_simulations=50, threat_override=False)
+        board = Board()
+        board.make_move(7, 7)
+        board.make_move(8, 8)
+
+        # First search.
+        result1 = mcts.search_with_stats(board)
+        top_move = max(result1.visit_counts, key=result1.visit_counts.get)
+        old_visits = result1.visit_counts[top_move]
+
+        # Play the top move.
+        board.make_move(*top_move)
+
+        # Second search — continues from the re-rooted subtree.
+        result2 = mcts.search_with_stats(board)
+        # The cumulative sims should be > the fresh sims.
+        assert result2.total_simulations > 50
+        # The distribution should still be valid.
+        total = sum(result2.visit_counts.values())
+        assert total > 0
+        assert abs(sum(v / total for v in result2.visit_counts.values()) - 1.0) < 1e-5
+    finally:
+        tmp.unlink()
+
+
+def test_tree_reuse_distribution_valid_after_reuse():
+    """Visit probabilities after tree reuse sum to 1 and only contain legal moves."""
+    wrapper, tmp = _make_wrapper()
+    try:
+        mcts = MCTS(wrapper, num_simulations=30, threat_override=False)
+        board = Board()
+        board.make_move(7, 7)
+        board.make_move(8, 8)
+
+        # Run two searches with a move in between.
+        result1 = mcts.search_with_stats(board)
+        move = max(result1.visit_counts, key=result1.visit_counts.get)
+        board.make_move(*move)
+
+        dist = mcts.search(board)
+        total = sum(dist.values())
+        assert abs(total - 1.0) < 1e-5
+        legal = board.get_legal_moves()
+        for m in dist:
+            assert m in legal, f"Tree reuse returned illegal move {m}"
+    finally:
+        tmp.unlink()

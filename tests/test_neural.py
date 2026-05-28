@@ -3,11 +3,14 @@
 import tempfile
 from pathlib import Path
 
+import pytest
 import torch
+import torch.nn as nn
 
 from engine.board import Board
 from neural.model import (
     AttentionAugmentedConv,
+    DropPath,
     GomokuNet,
     PreActSEResidualBlock,
     ResidualBlock,
@@ -173,34 +176,41 @@ def test_model_with_pre_activation_and_old_defaults():
     assert value.shape == (2, 1)
 
 
-def test_value_global_pool_shape():
-    """Value output shape is (B, 1) regardless of global pooling."""
-    model = GomokuNet(value_global_pool=True)
+def test_value_head_no_nan():
+    """Value head produces finite outputs for random input."""
+    model = GomokuNet()
     x = torch.randn(4, 3, 15, 15)
     _, value = model(x)
     assert value.shape == (4, 1)
-    assert (-1.0 <= value).all() and (value <= 1.0).all()
+    assert not torch.isnan(value).any()
+    assert not torch.isinf(value).any()
 
 
-def test_value_global_pool_disabled():
-    """Model works with value_global_pool=False (original value head)."""
-    model = GomokuNet(value_global_pool=False)
+def test_value_head_range():
+    """Value output is in [-1, 1]."""
+    model = GomokuNet()
     x = torch.randn(4, 3, 15, 15)
     _, value = model(x)
-    assert value.shape == (4, 1)
     assert (-1.0 <= value).all() and (value <= 1.0).all()
 
 
-def test_value_global_pool_vs_disabled():
-    """Outputs differ when global pooling is enabled vs disabled."""
-    model_on = GomokuNet(value_global_pool=True, use_pre_activation=False)
-    model_off = GomokuNet(value_global_pool=False, use_pre_activation=False)
+def test_value_head_deterministic():
+    """Same input produces same value in eval mode."""
+    model = GomokuNet()
+    model.eval()
     x = torch.randn(2, 3, 15, 15)
     with torch.no_grad():
-        _, v_on = model_on(x.clone())
-        _, v_off = model_off(x.clone())
-    # Random initialized parameters should give different values
-    assert not torch.allclose(v_on, v_off, atol=1e-3)
+        _, v1 = model(x)
+        _, v2 = model(x)
+    assert torch.allclose(v1, v2)
+
+
+def test_value_dual_pooling():
+    """Value head uses both avg and max pooling (verified by shape)."""
+    model = GomokuNet(num_hidden_channels=128)
+    # value_fc1 takes 2*C = 256 inputs
+    assert model.value_fc1.in_features == 256
+    assert model.value_fc1.out_features == 64
 
 
 def test_model_output_shapes():
@@ -464,3 +474,146 @@ def test_batch_evaluate_with_threats_block_boosting():
     block_moves = {(7, 2), (7, 6), (5, 6), (7, 6)}
     for m in block_moves:
         assert m in dict(probs)
+
+
+# ---------------------------------------------------------------------------
+# Upgraded architecture tests (v2)
+# ---------------------------------------------------------------------------
+
+
+def test_policy_head_fully_convolutional():
+    """Policy head uses 1×1 conv projection, not an FC layer."""
+    model = GomokuNet()
+    # New policy head: policy_conv1 (3×3), policy_conv2 (1×1), no policy_fc
+    assert hasattr(model, "policy_conv2")
+    assert isinstance(model.policy_conv2, nn.Conv2d)
+    assert model.policy_conv2.out_channels == 1
+    assert not hasattr(model, "policy_fc")
+
+
+def test_policy_head_output_shape():
+    """Fully-conv policy head still produces (B, 225) log-softmax."""
+    model = GomokuNet()
+    x = torch.randn(4, 3, 15, 15)
+    log_policy, _ = model(x)
+    assert log_policy.shape == (4, 225)
+    probs = torch.exp(log_policy)
+    assert torch.allclose(probs.sum(dim=1), torch.tensor([1.0]), atol=1e-5)
+
+
+def test_se_reduction_default():
+    """Default SE reduction is 8 (bottleneck ≥ 16 for 128-ch networks)."""
+    model = GomokuNet()
+    se = model.res_blocks[0].se
+    assert se.fc1.out_features >= 16  # 128 // 8 = 16
+    assert se.fc1.out_features == se.fc2.in_features
+
+
+def test_attention_heads_default():
+    """Default is 4 attention heads."""
+    model = GomokuNet()
+    attn = model.res_blocks[0].attn
+    assert attn.num_heads == 4
+    assert attn.head_dim == 32  # 128 // 4
+
+
+def test_attention_has_layernorm():
+    """Attention module includes a pre-projection LayerNorm."""
+    model = GomokuNet()
+    attn = model.res_blocks[0].attn
+    assert hasattr(attn, "norm")
+    assert isinstance(attn.norm, nn.LayerNorm)
+
+
+def test_dilation_schedule_is_pyramid():
+    """Dilation schedule ramps 1→2→3→2→1 for 10 blocks."""
+    model = GomokuNet(num_res_blocks=10)
+    dilations = [
+        b.conv1.dilation[0]  # type: ignore[attr-defined]
+        for b in model.res_blocks
+    ]
+    # Must contain all three dilation levels
+    assert 1 in dilations
+    assert 2 in dilations
+    assert 3 in dilations
+    # Must start and end with dilation 1
+    assert dilations[0] == 1
+    assert dilations[-1] == 1
+    # Monotonically increases then decreases
+    peak_idx = dilations.index(max(dilations))
+    for i in range(peak_idx):
+        assert dilations[i] <= dilations[i + 1]
+    for i in range(peak_idx, len(dilations) - 1):
+        assert dilations[i] >= dilations[i + 1]
+
+
+def test_dilation_schedule_custom():
+    """Custom dilation schedule is respected."""
+    custom = [1, 2, 3, 1, 2]
+    model = GomokuNet(num_res_blocks=5, dilations=custom)
+    dilations = [
+        b.conv1.dilation[0]  # type: ignore[attr-defined]
+        for b in model.res_blocks
+    ]
+    assert dilations == custom
+
+
+def test_dilation_schedule_length_mismatch_raises():
+    """ValueError when dilations length != num_res_blocks."""
+    with pytest.raises(ValueError):
+        GomokuNet(num_res_blocks=5, dilations=[1, 2, 3])
+
+
+def test_drop_path_created():
+    """Each residual block has a DropPath module."""
+    model = GomokuNet(drop_path_rate=0.1)
+    for block in model.res_blocks:
+        assert hasattr(block, "drop_path")
+        assert isinstance(block.drop_path, (DropPath, nn.Identity))
+
+
+def test_drop_path_linear_schedule():
+    """DropPath rates increase linearly from 0 to drop_path_rate."""
+    model = GomokuNet(drop_path_rate=0.2, num_res_blocks=10)
+    # Blocks with drop_prob==0 get nn.Identity; later blocks get DropPath.
+    drop_probs: list[float] = []
+    for block in model.res_blocks:
+        if isinstance(block.drop_path, DropPath):
+            drop_probs.append(block.drop_path.drop_prob)
+    # At least the last half of blocks should have DropPath.
+    assert len(drop_probs) > 0
+    assert drop_probs[-1] == pytest.approx(0.2)
+    for i in range(len(drop_probs) - 1):
+        assert drop_probs[i] <= drop_probs[i + 1]
+
+
+def test_drop_path_training_vs_eval():
+    """DropPath is active in train() but identity in eval()."""
+    drop = DropPath(drop_prob=0.5)
+    x = torch.ones(1000, 1, 1, 1)
+
+    drop.train()
+    out = drop(x)
+    num_nonzero = (out.abs() > 1e-6).sum().item()
+    assert 350 < num_nonzero < 650  # ~50% kept, scaled by 2
+
+    drop.eval()
+    out_eval = drop(x)
+    assert torch.allclose(out_eval, x)
+
+
+def test_conv_policy_head_preserves_spatial_structure():
+    """Policy head without FC preserves spatial locality for inference."""
+    model = GomokuNet()
+    model.eval()
+    # The policy_conv2 is 1×1, so each output cell depends only on the
+    # corresponding input feature column.
+    assert model.policy_conv2.kernel_size == (1, 1)
+    assert model.policy_conv2.out_channels == 1
+
+
+def test_new_model_parameter_count():
+    """v2 model parameter count is within expected range (3-4M)."""
+    model = GomokuNet()
+    total = sum(p.numel() for p in model.parameters())
+    assert 3_000_000 < total < 4_000_000

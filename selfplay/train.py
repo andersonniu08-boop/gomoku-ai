@@ -14,6 +14,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from engine.board import Board, Player
 from neural.model import GomokuNet
 from neural.wrapper import GomokuInferenceWrapper
+from selfplay.elo import EloTracker
 from selfplay.mcts import MCTS
 from selfplay.replay_buffer import ReplayBuffer
 from selfplay.selfplay import SelfPlayGame, TrainingExample
@@ -185,15 +186,19 @@ def train_on_examples(
 def _play_eval_game(
     black_wrapper: GomokuInferenceWrapper,
     white_wrapper: GomokuInferenceWrapper,
-    num_simulations: int = 100,
+    num_simulations: int = 800,
 ) -> Player | None:
     """Play one deterministic game between two different models.
+
+    Uses a strong search (800 sims by default) so that model-comparison
+    games are a meaningful strength test, not a lottery.  Weak-search
+    evaluation produces noisy win rates that can promote regressions.
 
     Returns the winner (Player.BLACK, Player.WHITE, or None for draw).
     """
     board = Board()
-    black_mcts = MCTS(black_wrapper, num_simulations=num_simulations, threat_override=True)
-    white_mcts = MCTS(white_wrapper, num_simulations=num_simulations, threat_override=True)
+    black_mcts = MCTS(black_wrapper, num_simulations=num_simulations, threat_override=True, tree_reuse=False)
+    white_mcts = MCTS(white_wrapper, num_simulations=num_simulations, threat_override=True, tree_reuse=False)
 
     while not board.is_terminal():
         mcts = black_mcts if board.current_player == Player.BLACK else white_mcts
@@ -244,7 +249,7 @@ def main(
     eval_frequency: int = 5,
     eval_games: int = 100,
     eval_threshold: float = 0.55,
-    mcts_simulations: int = 400,
+    mcts_simulations: int = 800,
     selfplay_temperature: float = 1.0,
     selfplay_temp_threshold: int = 15,
     device: Optional[str] = None,
@@ -312,6 +317,17 @@ def main(
     # Mixed-precision GradScaler for CUDA training.
     scaler = torch.amp.GradScaler("cuda") if "cuda" in device else None
 
+    # ------------------------------------------------------------------
+    # Elo tracking — persist across training sessions.
+    # ------------------------------------------------------------------
+    elo_path = data_dir / "elo_state.json"
+    elo_tracker = EloTracker()
+    if elo_path.exists():
+        elo_tracker.load(elo_path)
+        print(f"Elo ratings loaded ({len(elo_tracker.known_checkpoints())} known)")
+    elo_tracker.register_checkpoint("best.pt", iteration=0)
+    elo_tracker.register_checkpoint("latest.pt")
+
     for iteration in range(1, num_iterations + 1):
         iter_start = time.monotonic()
 
@@ -377,15 +393,55 @@ def main(
                 latest_path, best_path, num_games=eval_games, device=device
             )
 
+            # Record Elo update from the evaluation match.
+            elo_tracker.record_match(
+                "latest.pt", "best.pt", win_rate, eval_games,
+                iteration=iteration,
+            )
+            latest_rating = elo_tracker.get_rating("latest.pt")
+            best_rating = elo_tracker.get_rating("best.pt")
+
             if win_rate >= eval_threshold:
                 pct = round(win_rate * 100)
                 promoted_name = f"best_iter{iteration:03d}_win{pct}.pt"
                 save_model_checkpoint(model, checkpoints_dir / promoted_name)
                 save_model_checkpoint(model, best_path)
-                print(f"  Promoted!  Win rate: {win_rate:.2%}  → {promoted_name}")
+                # Register the promoted checkpoint, inheriting latest's rating.
+                elo_tracker.register_checkpoint(
+                    promoted_name, iteration=iteration,
+                    rating=latest_rating,
+                )
+                print(f"  Promoted!  Win rate: {win_rate:.2%}  "
+                      f"→ {promoted_name}")
             else:
                 print(f"  Not promoted.  Win rate: {win_rate:.2%}  "
                       f"(threshold {eval_threshold:.0%})")
+
+            # Show Elo summary.
+            print(f"  Elo: latest={latest_rating:.1f}, "
+                  f"best={best_rating:.1f}")
+
+        # Save Elo and buffer state after each iteration.
+        elo_tracker.save(elo_path)
+
+        # Print replay diversity stats every iteration so the operator
+        # can monitor training-data quality (opening convergence, move
+        # distribution skew, win/loss balance).
+        if len(buffer) > 0:
+            stats = buffer.diversity_stats()
+            opens = stats["openings_top"]
+            top_opens = "  ".join(
+                f"#{h[:8]}…×{c}" for h, c in opens[:3]
+            ) if opens else "(none)"
+            print(
+                f"  replay: {stats['total_positions']} pos, "
+                f"{stats['unique_openings']} openings "
+                f"({stats['opening_diversity_ratio']:.1%} unique), "
+                f"moves={stats['move_distribution']}, "
+                f"vals={stats['value_distribution']}"
+            )
+            if opens:
+                print(f"  top openings: {top_opens}")
 
         # Brief pause so workers can write more files.
         time.sleep(2)

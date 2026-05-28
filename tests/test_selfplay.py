@@ -423,6 +423,7 @@ def test_selfplay_no_double_search():
                 num_simulations=10,
                 temperature=1.0,
                 temperature_threshold=0,
+                opening_moves=0,
                 augment=False,
             )
             examples = game.play()

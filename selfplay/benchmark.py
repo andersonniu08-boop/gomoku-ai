@@ -241,8 +241,8 @@ def run_benchmark(
 
 def main():
     parser = argparse.ArgumentParser(description="MCTS benchmark suite")
-    parser.add_argument("--sims", type=int, default=200,
-                        help="MCTS simulations per search (default: 200)")
+    parser.add_argument("--sims", type=int, default=800,
+                        help="MCTS simulations per search (default: 800)")
     parser.add_argument("--batch", type=int, default=8,
                         help="MCTS batch size (default: 8)")
     parser.add_argument("--iterations", type=int, default=3,
