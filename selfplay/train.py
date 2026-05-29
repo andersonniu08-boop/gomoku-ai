@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import csv
+import os
 import random
 import time
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LRScheduler
 
 from engine.board import Board, Player
 from neural.model import GomokuNet
@@ -71,6 +74,93 @@ def save_model_checkpoint(model: GomokuNet, path: str | Path) -> None:
     tmp.rename(path)
 
 
+def set_seed(seed: int) -> None:
+    """Set deterministic seed for Python, NumPy, and PyTorch (CPU + CUDA)."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
+_CSV_COLUMNS = [
+    "iteration", "loss", "policy_loss", "value_loss", "entropy",
+    "grad_norm", "learning_rate", "buffer_size", "simulations",
+    "iteration_runtime_sec",
+]
+
+
+def _init_csv_log(csv_path: Path) -> None:
+    """Create the CSV log file with a header if it does not exist."""
+    if not csv_path.exists():
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(str(csv_path), "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(_CSV_COLUMNS)
+            f.flush()
+            os.fsync(f.fileno())
+
+
+def _append_csv_row(csv_path: Path, row: dict[str, object]) -> None:
+    """Append one row to the CSV log and flush immediately."""
+    with open(str(csv_path), "a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([row[col] for col in _CSV_COLUMNS])
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def save_training_state(
+    state_path: Path,
+    model: GomokuNet,
+    optimizer: torch.optim.Optimizer,
+    scheduler: Optional[LRScheduler],
+    scaler: Optional[torch.amp.GradScaler],
+    iteration: int,
+) -> None:
+    """Save full training state atomically for crash recovery.
+
+    Writes to a temporary file first, then atomically renames.
+    """
+    state: dict[str, object] = {
+        "iteration": iteration,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+    }
+    if scheduler is not None:
+        state["scheduler_state_dict"] = scheduler.state_dict()
+    if scaler is not None:
+        state["scaler_state_dict"] = scaler.state_dict()
+
+    tmp = state_path.with_suffix(".tmp")
+    torch.save(state, str(tmp))
+    tmp.rename(state_path)
+
+
+def load_training_state(
+    state_path: Path,
+    model: GomokuNet,
+    optimizer: torch.optim.Optimizer,
+    scheduler: Optional[LRScheduler],
+    scaler: Optional[torch.amp.GradScaler],
+) -> int:
+    """Restore full training state from *state_path*.
+
+    Returns the iteration number to resume from.
+    """
+    state = torch.load(str(state_path), map_location="cpu", weights_only=False)
+    model.load_state_dict(state["model_state_dict"])
+    optimizer.load_state_dict(state["optimizer_state_dict"])
+    if scheduler is not None and "scheduler_state_dict" in state:
+        scheduler.load_state_dict(state["scheduler_state_dict"])
+    if scaler is not None and "scaler_state_dict" in state:
+        scaler.load_state_dict(state["scaler_state_dict"])
+    return int(state["iteration"])
+
+
 def ingest_game_files(
     buffer: ReplayBuffer,
     game_dir: Path,
@@ -109,14 +199,10 @@ def ingest_game_files(
             print(f"  [trainer] Skipping empty/invalid file: {path.name}")
             continue
 
-        # Worker files are written without augmentation (augment=False).
-        # The ReplayBuffer applies random D₄ symmetry on retrieval,
-        # giving equivalent data diversity at 1/8th the memory.
         buffer.add_examples(examples)
         path.rename(consumed_dir / path.name)
         ingested += 1
 
-    # Trim consumed directory to *max_consumed* most-recent files.
     consumed_files = sorted(
         consumed_dir.glob("game_*.pt"), key=lambda p: p.stat().st_mtime
     )
@@ -177,7 +263,6 @@ def train_on_examples(
                 log_policy, value, target_policies, target_values
             )
 
-        # Policy entropy: H(P) = -sum(P * log P)
         probs = torch.exp(log_policy)
         entropy = -(probs * log_policy).sum(dim=1).mean()
 
@@ -223,10 +308,6 @@ def _play_eval_game(
 ) -> Player | None:
     """Play one deterministic game between two different models.
 
-    Uses a strong search (800 sims by default) so that model-comparison
-    games are a meaningful strength test, not a lottery.  Weak-search
-    evaluation produces noisy win rates that can promote regressions.
-
     Returns the winner (Player.BLACK, Player.WHITE, or None for draw).
     """
     board = Board()
@@ -270,7 +351,6 @@ def run_evaluation(
             new_wins += 1
         elif winner is None:
             new_wins += 0.5
-        # else: new model lost
 
     return new_wins / num_games
 
@@ -290,6 +370,7 @@ def main(
     game_examples_dir: str | Path = "game_examples/",
     max_grad_norm: float = 5.0,
     resignation_warmup_iters: int = 10,
+    seed: Optional[int] = None,
 ) -> None:
     """Run the AlphaZero training loop.
 
@@ -300,7 +381,14 @@ def main(
     When *game_examples_dir* contains worker-produced game files they are
     ingested first.  If the replay buffer is still below *batch_size*,
     *games_per_iteration* local games are generated as a fallback.
+
+    When *seed* is provided, Python, NumPy, and PyTorch RNGs are seeded
+    deterministically for reproducible training runs.
     """
+    if seed is not None:
+        set_seed(seed)
+        print(f"Deterministic seed: {seed}")
+
     checkpoints_dir = Path("checkpoints")
     data_dir = Path("data")
     game_dir = Path(game_examples_dir)
@@ -312,6 +400,8 @@ def main(
     best_path = checkpoints_dir / "best.pt"
     latest_path = checkpoints_dir / "latest.pt"
     buffer_path = data_dir / "replay_buffer.pt"
+    state_path = data_dir / "training_state.pt"
+    csv_path = data_dir / "training_log.csv"
 
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -336,17 +426,12 @@ def main(
     print(f"Generating {games_per_iteration} local games/iter as fallback")
 
     # Persistent model, optimizer, and LR schedule across iterations.
-    # Adam momentum/variance accumulates naturally rather than resetting
-    # each iteration, giving stable training dynamics.
     model = GomokuNet()
     model.to(device)
     optimizer = torch.optim.Adam(
         model.parameters(), lr=learning_rate, weight_decay=1e-4
     )
 
-    # Cosine annealing over the full training run (~10 batches / iteration).
-    # T_max spans all batches so the LR reaches 0 at the final step,
-    # avoiding per-iteration LR spikes that destabilise late-stage learning.
     batches_per_iter = max(1, (batch_size * 10 + batch_size - 1) // batch_size)
     scheduler = CosineAnnealingLR(optimizer, T_max=num_iterations * batches_per_iter)
 
@@ -364,20 +449,33 @@ def main(
     elo_tracker.register_checkpoint("best.pt", iteration=0)
     elo_tracker.register_checkpoint("latest.pt")
 
-    for iteration in range(1, num_iterations + 1):
+    # ------------------------------------------------------------------
+    # Crash recovery: restore training state if a previous run exists.
+    # ------------------------------------------------------------------
+    start_iteration = 1
+    if state_path.exists():
+        print("Found training state — resuming from checkpoint ...")
+        start_iteration = load_training_state(
+            state_path, model, optimizer, scheduler, scaler,
+        ) + 1
+        model.to(device)
+        save_model_checkpoint(model, latest_path)
+        print(f"Resumed at iteration {start_iteration}")
+
+    # ------------------------------------------------------------------
+    # CSV logging — create the log file if it does not exist.
+    # ------------------------------------------------------------------
+    _init_csv_log(csv_path)
+
+    for iteration in range(start_iteration, num_iterations + 1):
         iter_start = time.monotonic()
 
         # --- Phase A: Collect self-play data ---
-        # 1. Ingest any worker-generated files (bonus data from distributed
-        #    workers, if any are running).
         ingested = ingest_game_files(buffer, game_dir, consumed_dir)
         if ingested > 0:
             print(f"\nIteration {iteration}: Ingested {ingested} game files, "
                   f"buffer now {len(buffer)}")
 
-        # 2. Generate fresh self-play games with the LATEST model every
-        #    iteration.  This is the core of AlphaZero policy iteration:
-        #    improved model → improved search → improved policy targets.
         current_sims = mcts_simulations
         if sim_schedule is not None:
             for start_iter, sims in sorted(sim_schedule, reverse=True):
@@ -386,16 +484,11 @@ def main(
                     break
 
         wrapper = GomokuInferenceWrapper(latest_path, device=device)
-        resign_thresh = (
-            None if iteration <= resignation_warmup_iters
-            else -0.9
-        )
         game_runner = SelfPlayGame(
             wrapper,
             num_simulations=current_sims,
             threat_override=True,
             augment=False,
-            resignation_threshold=resign_thresh,
         )
 
         for _ in range(games_per_iteration):
@@ -405,12 +498,9 @@ def main(
         torch.save(buffer.state_dict(), str(buffer_path))
 
         # 3. Sample a training batch from the full replay buffer.
-        #    Mixes fresh examples with older ones from previous iterations.
         train_examples = buffer.sample(min(len(buffer), batch_size * 10))
 
         # --- Phase B: Train ---
-        # Reload latest weights into the persistent model so optimizer
-        # retains momentum across checkpoint versions.
         checkpoint = torch.load(
             str(latest_path), map_location=device, weights_only=True
         )
@@ -446,7 +536,6 @@ def main(
                 num_simulations=eval_simulations,
             )
 
-            # Record Elo update from the evaluation match.
             elo_tracker.record_match(
                 "latest.pt", "best.pt", win_rate, eval_games,
                 iteration=iteration,
@@ -459,7 +548,6 @@ def main(
                 promoted_name = f"best_iter{iteration:03d}_win{pct}.pt"
                 save_model_checkpoint(model, checkpoints_dir / promoted_name)
                 save_model_checkpoint(model, best_path)
-                # Register the promoted checkpoint, inheriting latest's rating.
                 elo_tracker.register_checkpoint(
                     promoted_name, iteration=iteration,
                     rating=latest_rating,
@@ -470,21 +558,41 @@ def main(
                 print(f"  Not promoted.  Win rate: {win_rate:.2%}  "
                       f"(threshold {eval_threshold:.0%})")
 
-            # Show Elo summary.
             print(f"  Elo: latest={latest_rating:.1f}, "
                   f"best={best_rating:.1f}")
 
-        # Save Elo and buffer state after each iteration.
+        # Save Elo state.
         elo_tracker.save(elo_path)
 
-        # Print replay diversity stats every iteration so the operator
-        # can monitor training-data quality (opening convergence, move
-        # distribution skew, win/loss balance).
+        # ------------------------------------------------------------------
+        # Persist full training state for crash recovery.
+        # ------------------------------------------------------------------
+        save_training_state(
+            state_path, model, optimizer, scheduler, scaler, iteration,
+        )
+
+        # ------------------------------------------------------------------
+        # Append CSV log row.
+        # ------------------------------------------------------------------
+        _append_csv_row(csv_path, {
+            "iteration": iteration,
+            "loss": f"{metrics['loss']:.6f}",
+            "policy_loss": f"{metrics['policy_loss']:.6f}",
+            "value_loss": f"{metrics['value_loss']:.6f}",
+            "entropy": f"{metrics['entropy']:.6f}",
+            "grad_norm": f"{metrics['grad_norm']:.6f}",
+            "learning_rate": f"{scheduler.get_last_lr()[0]:.8f}",
+            "buffer_size": len(buffer),
+            "simulations": current_sims,
+            "iteration_runtime_sec": f"{elapsed:.2f}",
+        })
+
+        # Print replay diversity stats.
         if len(buffer) > 0:
             stats = buffer.diversity_stats()
             opens = stats["openings_top"]
             top_opens = "  ".join(
-                f"#{h[:8]}…×{c}" for h, c in opens[:3]
+                f"#{h[:8]}...x{c}" for h, c in opens[:3]
             ) if opens else "(none)"
             print(
                 f"  replay: {stats['total_positions']} pos, "
@@ -496,7 +604,6 @@ def main(
             if opens:
                 print(f"  top openings: {top_opens}")
 
-        # Brief pause so workers can write more files.
         time.sleep(2)
 
     print(f"\nDone.  Best model: {best_path}")
