@@ -354,13 +354,20 @@ class MCTS:
         has elapsed (time-budget mode).  When both are set, time budget
         takes precedence.
         """
+        import sys
         sims_done = 0
         use_time_budget = self.time_budget_ms is not None
         deadline = None
         if use_time_budget:
             deadline = time.monotonic() + self.time_budget_ms / 1000.0
 
+        _batch_idx = 0
         while True:
+            import sys
+            _batch_idx += 1
+            if _batch_idx <= 3 or _batch_idx % 50 == 0:
+                print("[DEBUG mcts] _run_search batch=%d  sims_done=%d/%d  use_time=%s  deadline=%s" % (
+                    _batch_idx, sims_done, fresh_sims, use_time_budget, deadline), flush=True)
             # --- Check termination ---
             if use_time_budget:
                 if time.monotonic() >= deadline:
@@ -404,10 +411,15 @@ class MCTS:
                 with self.profiler.measure("search.neural_eval"):
                     eval_indices = [i for i, t in enumerate(leaf_terminal) if not t]
                     eval_boards = [leaf_boards[i] for i in eval_indices]
+                    import sys
+                    print("[DEBUG mcts] evaluator.evaluate ENTER  n_boards=%d/%d" % (
+                        len(eval_boards), len(leaf_boards)), flush=True)
                     if eval_boards:
                         batch_results = self.evaluator.evaluate(eval_boards)
                     else:
                         batch_results = []
+                    print("[DEBUG mcts] evaluator.evaluate DONE  results=%d" % (
+                        len(batch_results)), flush=True)
 
                 # ---- expand & backup ----
                 with self.profiler.measure("search.expand_backup"):

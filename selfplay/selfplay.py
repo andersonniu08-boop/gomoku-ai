@@ -7,6 +7,8 @@ MCTS-guided games where two copies of the same AI play each other.
 from __future__ import annotations
 
 import random
+import sys
+import time
 from dataclasses import dataclass
 from typing import Callable
 
@@ -193,8 +195,14 @@ class SelfPlayGame:
     # Public API
     # ------------------------------------------------------------------
 
+    _DEBUG = True  # ── TEMPORARY DEBUG ── set False to disable
+
     def play(self) -> list[TrainingExample]:
         """Run one self-play game and return labelled training examples."""
+        if self._DEBUG:
+            print("[DEBUG play] ENTRY num_sims=%d temp_stages=%s" % (
+                self.num_simulations, self.temperature_stages), flush=True)
+
         board = Board()
         mcts = MCTS(
             self.wrapper,
@@ -214,25 +222,51 @@ class SelfPlayGame:
         consecutive_lost: int = 0
         resigned = False
 
+        _max_moves = 225  # safety: board can hold at most 225 stones
+        _move_timeout_s = 120.0  # safety: single move must complete within 2 min
+        t0 = time.monotonic()
         while not board.is_terminal():
             move_num = len(board.move_history)
+            if move_num >= _max_moves:
+                if self._DEBUG:
+                    print("[DEBUG play] SAFETY BREAK: max moves %d reached" % _max_moves, flush=True)
+                break
             temp = self._temperature_for_move(move_num)
+
+            if self._DEBUG:
+                print("[DEBUG play] move=%d temp=%.2f turn=%d legal=%d" % (
+                    move_num, temp, board.current_player,
+                    len(board.get_legal_moves())), flush=True)
 
             # --- Opening diversity: use MCTS with high temperature ---
             if move_num < self.opening_moves:
+                if self._DEBUG:
+                    print("[DEBUG play] move=%d → _opening_move" % move_num, flush=True)
                 state, policy, move = self._opening_move(board, mcts)
                 raw.append((state, policy, board.current_player))
                 board.make_move(*move)
                 continue
 
+            if self._DEBUG:
+                print("[DEBUG play] move=%d → mcts.search_with_stats ENTER" % move_num, flush=True)
+            t_search = time.monotonic()
             search_result = mcts.search_with_stats(board)
+            t_search = time.monotonic() - t_search
+            if self._DEBUG:
+                print("[DEBUG play] move=%d ← mcts.search_with_stats EXIT sims=%d visits=%d q=%d dt=%.2fs" % (
+                    move_num, search_result.total_simulations,
+                    len(search_result.visit_counts),
+                    len(search_result.q_values), t_search), flush=True)
+
             if search_result.total_simulations > 0:
                 visit_probs = {m: c / search_result.total_simulations
-                              for m, c in search_result.visit_counts.items()}
+                               for m, c in search_result.visit_counts.items()}
             elif search_result.visit_counts:
                 visit_probs = {m: 1.0 / len(search_result.visit_counts)
-                              for m in search_result.visit_counts}
+                               for m in search_result.visit_counts}
             else:
+                if self._DEBUG:
+                    print("[DEBUG play] move=%d → BREAK (no visit_probs)" % move_num, flush=True)
                 break
 
             state = board_to_tensor(board).squeeze(0)
@@ -244,19 +278,20 @@ class SelfPlayGame:
 
             raw.append((state, policy, board.current_player))
 
+            if self._DEBUG:
+                print("[DEBUG play] move=%d → select_move(temp=%.2f)" % (move_num, temp), flush=True)
             move = mcts.select_move(board, temperature=temp, visit_probs=visit_probs)
             board.make_move(*move)
+            if self._DEBUG:
+                print("[DEBUG play] move=%d applied (%d,%d) winner=%s terminal=%s" % (
+                    move_num, move[0], move[1], board.check_win(),
+                    board.is_terminal()), flush=True)
 
             # --- Resignation check using tree Q-values ---
             if self.resignation_threshold is not None and search_result.q_values:
                 root_value = self._estimate_root_value(search_result.q_values,
                                                        search_result.visit_counts)
                 if root_value < self.resignation_threshold:
-                    # Tactical safety: verify that the current side to move
-                    # does not have forced wins or forced defenses before
-                    # counting toward resignation.  This prevents the value
-                    # head from causing incorrect resignations during early
-                    # training when it is still unreliable.
                     analysis = TacticalSolver.analyze_lightweight(board)
                     if analysis.has_forced_win or analysis.has_forced_defense:
                         consecutive_lost = 0
@@ -266,7 +301,15 @@ class SelfPlayGame:
                     consecutive_lost = 0
                 if consecutive_lost >= self.resignation_moves:
                     resigned = True
+                    if self._DEBUG:
+                        print("[DEBUG play] move=%d → RESIGNATION" % move_num, flush=True)
                     break
+
+        dt_game = time.monotonic() - t0
+        if self._DEBUG:
+            print("[DEBUG play] LOOP EXIT moves=%d terminal=%s resigned=%s dt=%.2fs" % (
+                len(board.move_history), board.is_terminal(), resigned, dt_game),
+                flush=True)
 
         # Phase 2 — convert to (state, policy, value_target)
         winner = board.check_win()

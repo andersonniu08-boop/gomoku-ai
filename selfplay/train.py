@@ -491,8 +491,13 @@ def main(
             augment=False,
         )
 
-        for _ in range(games_per_iteration):
+        for game_i in range(games_per_iteration):
+            import sys
+            t_game = time.monotonic()
+            print(f"[DEBUG train] game_runner.play() #{game_i+1}/{games_per_iteration} ENTER", flush=True)
             examples = game_runner.play()
+            t_game = time.monotonic() - t_game
+            print(f"[DEBUG train] game_runner.play() #{game_i+1} DONE  examples={len(examples)}  dt={t_game:.1f}s", flush=True)
             buffer.add_examples(examples)
 
         torch.save(buffer.state_dict(), str(buffer_path))
