@@ -250,7 +250,7 @@ async function makeMove(r, c) {
   humanPlayer = newState.human_player;
   currentStrength = newState.strength || currentStrength;
 
-  drawBoard(newState);
+  drawBoardWithHover(newState);
   updateStatus(newState);
   updateSearchPanel(newState.search, newState.ai_move);
 }
@@ -274,10 +274,75 @@ async function startNewGame(side, strength) {
   humanPlayer = newState.human_player;
   currentStrength = newState.strength || strength;
 
-  drawBoard(newState);
+  drawBoardWithHover(newState);
   updateStatus(newState);
   updateSearchPanel(newState.search, newState.ai_move);
 }
+
+// ─── Hover preview ───
+
+let hoverCell = null;   // [r, c] or null
+
+function drawBoardWithHover(state) {
+  drawBoard(state);
+
+  if (!hoverCell || thinking) return;
+  if (!state || state.winner !== null) return;
+
+  const [r, c] = hoverCell;
+  if (state.board[r][c] !== 0) return;
+  const isLegal = state.legal_moves.some(([lr, lc]) => lr === r && lc === c);
+  if (!isLegal) return;
+
+  const { x, y } = gridToPixel(r, c);
+
+  // Subtle highlight ring around hover cell
+  ctx.beginPath();
+  ctx.arc(x, y, STONE_RADIUS + 3, 0, Math.PI * 2);
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.8)';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  // Ghost stone (translucent orb)
+  const isBlack = state.current_player === 1;
+  const grad = ctx.createRadialGradient(x - 3, y - 3, 1, x, y, STONE_RADIUS);
+  if (isBlack) {
+    grad.addColorStop(0, 'rgba(85, 85, 85, 0.55)');
+    grad.addColorStop(1, 'rgba(17, 17, 17, 0.55)');
+  } else {
+    grad.addColorStop(0, 'rgba(255, 255, 255, 0.55)');
+    grad.addColorStop(1, 'rgba(204, 204, 204, 0.55)');
+  }
+  ctx.beginPath();
+  ctx.arc(x, y, STONE_RADIUS, 0, Math.PI * 2);
+  ctx.fillStyle = grad;
+  ctx.fill();
+}
+
+canvas.addEventListener('mousemove', (e) => {
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  const px = (e.clientX - rect.left) * scaleX;
+  const py = (e.clientY - rect.top) * scaleY;
+  const cell = gridFromPixel(px, py);
+
+  const prev = hoverCell;
+  hoverCell = cell;
+
+  // Only redraw if the hover cell actually changed
+  if (state) {
+    if (prev && cell && prev[0] === cell[0] && prev[1] === cell[1]) return;
+    drawBoardWithHover(state);
+  }
+});
+
+canvas.addEventListener('mouseleave', () => {
+  if (hoverCell && state) {
+    hoverCell = null;
+    drawBoard(state);
+  }
+});
 
 // ─── Canvas click handler ───
 
@@ -308,7 +373,7 @@ canvas.addEventListener('click', (e) => {
 document.getElementById('toggle-heatmap').addEventListener('click', () => {
   heatmapOn = !heatmapOn;
   document.getElementById('toggle-heatmap').classList.toggle('active');
-  if (state) drawBoard(state);
+  if (state) drawBoardWithHover(state);
 });
 
 document.getElementById('toggle-tree').addEventListener('click', () => {
