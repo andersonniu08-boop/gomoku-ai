@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 from enum import IntEnum
 from typing import Optional
 
@@ -15,6 +16,25 @@ class Player(IntEnum):
 # Directions for win-checking: (row_delta, col_delta)
 # Only need 4 directions — each covers both senses along an axis.
 _DIRECTIONS = ((0, 1), (1, 0), (1, 1), (1, -1))
+
+_ZOBRIST_TABLE: Optional[list[list[list[int]]]] = None
+
+
+def _init_zobrist_table() -> list[list[list[int]]]:
+    """Lazily generate deterministic Zobrist keys.
+
+    Uses a fixed seed so keys are reproducible across processes.
+    ``_ZOBRIST_TABLE[r][c][p_idx]`` where *p_idx* is 0 for Black, 1 for White.
+    """
+    rng = random.Random(42)
+    return [
+        [[rng.getrandbits(64) for _ in range(2)] for _ in range(15)]
+        for _ in range(15)
+    ]
+
+
+def _zobrist_player_index(player: Player) -> int:
+    return 0 if player == Player.BLACK else 1
 
 
 class Board:
@@ -37,6 +57,15 @@ class Board:
         self.current_player: Player = Player.BLACK
         self.move_history: list[tuple[int, int]] = []
         self._winner: Optional[Player] = None
+        self._zobrist_key: int = 0
+
+    @property
+    def zobrist_key(self) -> int:
+        """64-bit Zobrist hash of the current board state.
+
+        Incrementally updated on every ``make_move`` / ``undo_move``.
+        """
+        return self._zobrist_key
 
     # ------------------------------------------------------------------
     # Core operations
@@ -54,6 +83,8 @@ class Board:
         self.grid[row, col] = self.current_player
         self.move_history.append((row, col))
 
+        self._update_zobrist(row, col, self.current_player)
+
         if self._check_win_at(row, col):
             self._winner = self.current_player
 
@@ -67,6 +98,8 @@ class Board:
         row, col = self.move_history.pop()
         player = Player(self.grid[row, col])
         self.grid[row, col] = 0
+
+        self._update_zobrist(row, col, player)
 
         self._winner = None
         self.current_player = player
@@ -108,6 +141,7 @@ class Board:
         new.current_player = self.current_player
         new.move_history = self.move_history.copy()
         new._winner = self._winner
+        new._zobrist_key = self._zobrist_key
         return new
 
     def __repr__(self) -> str:
@@ -146,3 +180,11 @@ class Board:
             if count >= self.WIN_LENGTH:
                 return True
         return False
+
+    def _update_zobrist(self, row: int, col: int, player: Player) -> None:
+        """XOR the Zobrist entry for *player* at *(row, col)* in/out."""
+        global _ZOBRIST_TABLE
+        if _ZOBRIST_TABLE is None:
+            _ZOBRIST_TABLE = _init_zobrist_table()
+        p_idx = _zobrist_player_index(player)
+        self._zobrist_key ^= _ZOBRIST_TABLE[row][col][p_idx]

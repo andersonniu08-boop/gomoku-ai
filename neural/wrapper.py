@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator, Optional
@@ -12,6 +13,61 @@ from engine.board import Board, Player
 from engine.encoding import board_to_tensor, policy_to_move_probs
 from engine.threats import ThreatDetector, ThreatType
 from neural.model import GomokuNet
+
+
+EvalResult = tuple[list[tuple[tuple[int, int], float]], float]
+
+
+class BoundedEvalCache:
+    """Fixed-capacity cache for neural-network board evaluations.
+
+    Keyed by ``(zobrist_key, current_player)`` so that the same board
+    position from the same player's perspective is recognised as a cache
+    hit regardless of the path taken to reach the state.
+
+    Uses ordered-dict FIFO eviction when capacity is exceeded.  Set
+    *max_size* to 0 to disable caching entirely.
+    """
+
+    def __init__(self, max_size: int = 0):
+        self.max_size = max_size
+        self._cache: OrderedDict[tuple[int, int], EvalResult] = OrderedDict()
+        self.hits: int = 0
+        self.misses: int = 0
+
+    def get(self, board: Board) -> Optional[EvalResult]:
+        if self.max_size <= 0:
+            return None
+        key = (board.zobrist_key, int(board.current_player))
+        if key in self._cache:
+            self._cache.move_to_end(key)
+            self.hits += 1
+            return self._cache[key]
+        self.misses += 1
+        return None
+
+    def put(
+        self,
+        board: Board,
+        move_probs: list[tuple[tuple[int, int], float]],
+        value: float,
+    ) -> None:
+        if self.max_size <= 0:
+            return
+        key = (board.zobrist_key, int(board.current_player))
+        if key in self._cache:
+            self._cache.move_to_end(key)
+        elif len(self._cache) >= self.max_size:
+            self._cache.popitem(last=False)
+        self._cache[key] = (move_probs, value)
+
+    def clear(self) -> None:
+        self._cache.clear()
+        self.hits = 0
+        self.misses = 0
+
+    def __len__(self) -> int:
+        return len(self._cache)
 
 
 class _NoopProfiler:
@@ -55,6 +111,7 @@ class GomokuInferenceWrapper:
         use_attention: Optional[bool] = None,
         use_pre_activation: Optional[bool] = None,
         profiler: Optional[object] = None,
+        cache_size: int = 0,
     ):
         if device is None:
             if torch.cuda.is_available():
@@ -114,6 +171,8 @@ class GomokuInferenceWrapper:
         # introspection (explainability tools register forward hooks
         # on res_blocks, which a torch.compiled model would bypass).
         self._raw_model = self.model
+
+        self.eval_cache = BoundedEvalCache(max_size=cache_size)
 
     # ------------------------------------------------------------------
     # Shared threat helpers used by evaluate_with_threats and
@@ -192,6 +251,10 @@ class GomokuInferenceWrapper:
             value:      scalar in [-1, 1] — expected outcome for
                         ``board.current_player``.
         """
+        cached = self.eval_cache.get(board)
+        if cached is not None:
+            return cached
+
         with self.profiler.measure("eval.board_to_tensor"):
             tensor = board_to_tensor(board).to(self.device)
 
@@ -202,6 +265,8 @@ class GomokuInferenceWrapper:
         with self.profiler.measure("eval.policy_to_move_probs"):
             move_probs = policy_to_move_probs(log_policy, board)
         value = float(value.item())
+
+        self.eval_cache.put(board, move_probs, value)
 
         return move_probs, value
 
@@ -229,22 +294,41 @@ class GomokuInferenceWrapper:
         if not boards:
             return []
 
-        with self.profiler.measure("eval.board_to_tensor"):
-            tensors = torch.cat(
-                [board_to_tensor(b) for b in boards], dim=0
-            ).to(self.device)
+        results: list[Optional[EvalResult]] = [None] * len(boards)
+        uncached_indices: list[int] = []
+        uncached_boards: list[Board] = []
 
-        with self.profiler.measure("eval.model_forward"):
-            with torch.no_grad():
-                log_policy, value = self.model(tensors)
-
-        results: list[tuple[list[tuple[tuple[int, int], float]], float]] = []
         for i, board in enumerate(boards):
-            with self.profiler.measure("eval.policy_to_move_probs"):
-                move_probs = policy_to_move_probs(log_policy[i : i + 1], board)
-            results.append((move_probs, float(value[i].item())))
+            cached = self.eval_cache.get(board)
+            if cached is not None:
+                results[i] = cached
+            else:
+                uncached_indices.append(i)
+                uncached_boards.append(board)
 
-        return results
+        if uncached_boards:
+            with self.profiler.measure("eval.board_to_tensor"):
+                tensors = torch.cat(
+                    [board_to_tensor(b) for b in uncached_boards], dim=0
+                ).to(self.device)
+
+            with self.profiler.measure("eval.model_forward"):
+                with torch.no_grad():
+                    log_policy, value = self.model(tensors)
+
+            for j, (orig_idx, board) in enumerate(
+                zip(uncached_indices, uncached_boards)
+            ):
+                with self.profiler.measure("eval.policy_to_move_probs"):
+                    move_probs = policy_to_move_probs(
+                        log_policy[j : j + 1], board
+                    )
+                v = float(value[j].item())
+                self.eval_cache.put(board, move_probs, v)
+                results[orig_idx] = (move_probs, v)
+
+        assert all(r is not None for r in results)
+        return results  # type: ignore[return-value]
 
     def evaluate_with_threats(
         self,
