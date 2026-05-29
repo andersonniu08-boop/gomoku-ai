@@ -269,6 +269,7 @@ def main(
     device: Optional[str] = None,
     game_examples_dir: str | Path = "game_examples/",
     max_grad_norm: float = 5.0,
+    resignation_warmup_iters: int = 10,
 ) -> None:
     """Run the AlphaZero training loop.
 
@@ -365,11 +366,16 @@ def main(
                     break
 
         wrapper = GomokuInferenceWrapper(latest_path, device=device)
+        resign_thresh = (
+            None if iteration <= resignation_warmup_iters
+            else -0.9
+        )
         game_runner = SelfPlayGame(
             wrapper,
             num_simulations=current_sims,
             threat_override=True,
             augment=False,
+            resignation_threshold=resign_thresh,
         )
 
         for _ in range(games_per_iteration):
