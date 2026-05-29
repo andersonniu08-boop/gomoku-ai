@@ -14,7 +14,6 @@ that significantly improves GPU utilisation by:
 
 from __future__ import annotations
 
-import time
 from typing import NamedTuple, Optional
 
 import numpy as np
@@ -141,15 +140,10 @@ class BatchedLeafEvaluator:
         # autocast gives ~2× throughput on tensor-core GPUs.
         with self.profiler.measure("eval.model_forward"):
             with torch.no_grad():
-                print("[DEBUG evaluator] model forward START batch=%d device=%s shape=%s" % (
-                    batch, self.device, tuple(tensor.shape)), flush=True)
-                t_fwd = time.time()
                 with torch.amp.autocast(
                     device_type=self.device.type, enabled=self.device.type == "cuda"
                 ):
                     log_policy, value = self.wrapper.model(tensor)
-                t_fwd = time.time() - t_fwd
-                print("[DEBUG evaluator] model forward DONE dt=%.3fs" % t_fwd, flush=True)
 
         # --- Efficient result extraction ------------------------------
         with self.profiler.measure("eval.postprocess"):
