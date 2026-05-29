@@ -189,6 +189,113 @@ def test_block_closed_four_survives():
     assert (7, 6) in surviving, "Block of closed four must survive pruning!"
 
 
+def test_block_five_is_tactical_score():
+    """Must-block moves (opponent 4+ consecutive) get score >= 500 (_BLOCK_FIVE)."""
+    board = Board()
+    _place_many(board, [
+        (8, 0), (7, 2),
+        (8, 2), (7, 3),
+        (8, 4), (7, 4),
+        (8, 6), (7, 5),
+    ])
+    probs = _uniform_probs(board)
+    scores = compute_tactical_scores(board, probs)
+    assert scores.get((7, 1), 0) >= 500.0, \
+        f"Block move (7,1) score {scores.get((7,1),0):.1f} should be >= 500"
+    assert scores.get((7, 6), 0) >= 500.0, \
+        f"Block move (7,6) score {scores.get((7,6),0):.1f} should be >= 500"
+
+
+def test_block_five_moves_are_must_keep():
+    """Must-block moves must be classified as must_keep, never pruned."""
+    board = Board()
+    _place_many(board, [
+        (8, 0), (7, 2),
+        (8, 2), (7, 3),
+        (8, 4), (7, 4),
+        (8, 6), (7, 5),
+    ])
+    probs = _uniform_probs(board)
+    result = order_and_filter_moves(board, probs, max_moves=2)
+    surviving = {m for m, _ in result}
+    assert (7, 1) in surviving, "Must-block (7,1) should survive max_moves=2"
+    assert (7, 6) in surviving, "Must-block (7,6) should survive max_moves=2"
+
+
+def test_block_five_does_not_trigger_hard_override():
+    """When only must-block moves exist, hard_override must NOT collapse
+    the search to only blocking moves — other candidates are kept."""
+    board = Board()
+    _place_many(board, [
+        (8, 0), (7, 2),
+        (8, 2), (7, 3),
+        (8, 4), (7, 4),
+        (8, 6), (7, 5),
+    ])
+    probs = _uniform_probs(board)
+    result = order_and_filter_moves(board, probs, max_moves=40)
+    surviving = {m for m, _ in result}
+    assert (7, 1) in surviving or (7, 6) in surviving
+    non_block = surviving - {(7, 1), (7, 6)}
+    assert len(non_block) > 0, (
+        f"Hard_override should not collapse to only block moves. "
+        f"Got only: {surviving}"
+    )
+
+
+def test_hard_override_still_fires_for_winning_move():
+    """Winning moves (create five) must still trigger hard_override."""
+    board = Board()
+    _place_many(board, [
+        (7, 2), (0, 0),
+        (7, 3), (0, 1),
+        (7, 4), (0, 2),
+        (7, 5), (0, 3),
+    ])
+    probs = _uniform_probs(board)
+    result = order_and_filter_moves(board, probs, max_moves=40)
+    surviving = {m for m, _ in result}
+    assert surviving == {(7, 1), (7, 6)}, \
+        f"Hard_override should return only winning moves, got {surviving}"
+
+
+def test_winning_move_overrides_block_move():
+    """When both a winning move and a must-block move exist, hard_override
+    returns only the winning move."""
+    board = Board()
+    _place_many(board, [
+        (7, 2), (9, 2),
+        (7, 3), (9, 3),
+        (7, 4), (9, 4),
+        (7, 5), (9, 5),
+    ])
+    probs = _uniform_probs(board)
+    result = order_and_filter_moves(board, probs, max_moves=40)
+    surviving = {m for m, _ in result}
+    assert surviving == {(7, 1), (7, 6)}, \
+        f"Winning moves should override blocks, got {surviving}"
+
+
+def test_must_block_moves_survive_with_other_candidates():
+    """Must-block moves survive alongside other candidates; search not collapsed."""
+    board = Board()
+    _place_many(board, [
+        (7, 1), (7, 2),
+        (0, 0), (7, 3),
+        (1, 1), (7, 4),
+        (2, 2), (7, 5),
+        (0, 9), (3, 3),
+        (1, 9), (4, 4),
+        (2, 9), (5, 5),
+    ])
+    probs = _uniform_probs(board)
+    result = order_and_filter_moves(board, probs, max_moves=40)
+    surviving = {m for m, _ in result}
+    assert (7, 6) in surviving, "Must-block of closed four must survive"
+    others = surviving - {(7, 6)}
+    assert len(others) > 0, f"Expected other candidates alongside block, got {len(others)}"
+
+
 # ---------------------------------------------------------------------------
 # Threat creation — moves that create threats get higher priority
 # ---------------------------------------------------------------------------
