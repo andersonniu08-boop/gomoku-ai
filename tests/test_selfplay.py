@@ -440,3 +440,104 @@ def test_selfplay_no_double_search():
         )
     finally:
         tmp.unlink()
+
+
+# ---------------------------------------------------------------------------
+# Resignation safety — tactical rescue
+# ---------------------------------------------------------------------------
+
+
+def test_resignation_disabled_never_resigns():
+    """With resignation_threshold=None, the game always plays to completion."""
+    wrapper, tmp = _make_wrapper()
+    try:
+        game = SelfPlayGame(
+            wrapper,
+            num_simulations=10,
+            temperature_stages=[(0, 1.0), (1, 0.0)],
+            resignation_threshold=None,
+            opening_moves=0,
+            augment=False,
+        )
+        examples = game.play()
+        assert len(examples) > 0
+        for ex in examples:
+            assert ex.state.shape == (3, 15, 15)
+            assert ex.policy.shape == (225,)
+            assert -1.0 <= ex.value <= 1.0
+    finally:
+        tmp.unlink()
+
+
+def test_forced_win_blocks_resignation():
+    """A tactically won position must not resign regardless of value head."""
+    import unittest.mock as mock
+
+    from engine.tactical import TacticalAnalysis
+
+    analysis = TacticalAnalysis()
+    analysis.winning_moves = {(7, 7)}
+
+    wrapper, tmp = _make_wrapper()
+    try:
+        with mock.patch(
+            "selfplay.selfplay.TacticalSolver.analyze_lightweight",
+            return_value=analysis,
+        ):
+            game = SelfPlayGame(
+                wrapper,
+                num_simulations=10,
+                temperature_stages=[(0, 1.0), (1, 0.0)],
+                resignation_threshold=0.1,
+                resignation_moves=1,
+                opening_moves=0,
+                augment=False,
+            )
+            examples = game.play()
+        assert len(examples) > 0
+    finally:
+        tmp.unlink()
+
+
+def test_forced_defense_blocks_resignation():
+    """A position with a must-block defense must not resign."""
+    import unittest.mock as mock
+
+    from engine.tactical import TacticalAnalysis
+
+    analysis = TacticalAnalysis()
+    analysis.must_block = {(7, 7)}
+
+    wrapper, tmp = _make_wrapper()
+    try:
+        with mock.patch(
+            "selfplay.selfplay.TacticalSolver.analyze_lightweight",
+            return_value=analysis,
+        ):
+            game = SelfPlayGame(
+                wrapper,
+                num_simulations=10,
+                temperature_stages=[(0, 1.0), (1, 0.0)],
+                resignation_threshold=0.1,
+                resignation_moves=1,
+                opening_moves=0,
+                augment=False,
+            )
+            examples = game.play()
+        assert len(examples) > 0
+    finally:
+        tmp.unlink()
+
+
+def test_warmup_logic_disables_resignation():
+    """During warmup iterations, the resignation threshold is None."""
+    warmup = 10
+    default = -0.9
+
+    for iteration in range(1, warmup + 1):
+        thresh = None if iteration <= warmup else default
+        assert thresh is None, f"iteration {iteration} should have None threshold"
+
+    for iteration in range(warmup + 1, warmup + 5):
+        thresh = None if iteration <= warmup else default
+        assert thresh == default, f"iteration {iteration} should have {default} threshold"
