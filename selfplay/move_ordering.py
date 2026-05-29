@@ -109,11 +109,13 @@ def order_and_filter_moves(
             candidates.append((m, adjusted))
 
     # --- Phase 3: build the final list ---
-    # Hard override: when forced winning / must-block moves exist, expand
-    # only those — the search must explore the tactical line immediately.
+    # Hard override: when forced winning moves exist, expand only those —
+    # the search must explore the tactical line immediately.
+    # Defensive must-block moves are kept via must_keep but do NOT
+    # collapse the search — other candidates are still explored.
     if hard_override and must_keep:
         forced = [(m, p) for m, p in must_keep
-                  if scores.get(m, 0) >= _BLOCK_FIVE or scores.get(m, 0) >= _CREATE_FIVE]
+                  if scores.get(m, 0) >= _CREATE_FIVE]
         if forced:
             total = sum(p for _, p in forced)
             if total > 0:
@@ -234,11 +236,11 @@ def _score_position_incremental(
         # --- Blocking value: opponent stones on this line ---
         opp_count = _count_in_line(grid, r, c, dr, dc, opponent)
         if opp_count >= 4:
-            score += _BLOCK_OPEN_FOUR
+            score += _BLOCK_FIVE
         elif opp_count >= 3:
-            score += _BLOCK_CLOSED_FOUR
+            score += _BLOCK_OPEN_FOUR
         elif opp_count >= 2:
-            score += _BLOCK_OPEN_THREE * 0.5
+            score += _BLOCK_CLOSED_FOUR
 
         # Connectivity bonus.
         if friendly >= 2:
