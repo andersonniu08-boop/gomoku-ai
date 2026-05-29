@@ -14,6 +14,7 @@ import torch
 
 from engine.board import Board, Player
 from engine.encoding import board_to_tensor
+from engine.tactical import TacticalSolver
 from neural.wrapper import GomokuInferenceWrapper
 from selfplay.mcts import MCTS
 
@@ -251,7 +252,16 @@ class SelfPlayGame:
                 root_value = self._estimate_root_value(search_result.q_values,
                                                        search_result.visit_counts)
                 if root_value < self.resignation_threshold:
-                    consecutive_lost += 1
+                    # Tactical safety: verify that the current side to move
+                    # does not have forced wins or forced defenses before
+                    # counting toward resignation.  This prevents the value
+                    # head from causing incorrect resignations during early
+                    # training when it is still unreliable.
+                    analysis = TacticalSolver.analyze_lightweight(board)
+                    if analysis.has_forced_win or analysis.has_forced_defense:
+                        consecutive_lost = 0
+                    else:
+                        consecutive_lost += 1
                 else:
                     consecutive_lost = 0
                 if consecutive_lost >= self.resignation_moves:
