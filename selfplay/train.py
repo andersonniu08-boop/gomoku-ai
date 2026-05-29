@@ -274,16 +274,27 @@ def train_on_examples(
             gn = torch.nn.utils.clip_grad_norm_(
                 model.parameters(), max_grad_norm
             )
+            if not torch.isfinite(gn):
+                print(f"  WARNING: non-finite grad norm {gn}, skipping batch")
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                continue
             scaler.step(optimizer)
             scaler.update()
+            if scheduler is not None:
+                scheduler.step()
         else:
             total.backward()
             gn = torch.nn.utils.clip_grad_norm_(
                 model.parameters(), max_grad_norm
             )
+            if not torch.isfinite(gn):
+                print(f"  WARNING: non-finite grad norm {gn}, skipping batch")
+                optimizer.zero_grad(set_to_none=True)
+                continue
             optimizer.step()
-        if scheduler is not None:
-            scheduler.step()
+            if scheduler is not None:
+                scheduler.step()
 
         total_loss += total.item()
         total_policy += policy_loss.item()
@@ -306,21 +317,27 @@ def _play_eval_game(
     black_wrapper: GomokuInferenceWrapper,
     white_wrapper: GomokuInferenceWrapper,
     num_simulations: int = 200,
-) -> Player | None:
+) -> tuple[Player | None, int]:
     """Play one deterministic game between two different models.
 
-    Returns the winner (Player.BLACK, Player.WHITE, or None for draw).
+    Returns ``(winner, move_count)``.
     """
     board = Board()
     black_mcts = MCTS(black_wrapper, num_simulations=num_simulations, threat_override=True, tree_reuse=False)
     white_mcts = MCTS(white_wrapper, num_simulations=num_simulations, threat_override=True, tree_reuse=False)
 
     while not board.is_terminal():
+        move_num = len(board.move_history)
+        if move_num >= 225:
+            break
         mcts = black_mcts if board.current_player == Player.BLACK else white_mcts
         move = mcts.select_move(board, temperature=0.0)
+        if move is None or move not in board.get_legal_moves():
+            print(f"  [eval] WARNING: degenerate move at count {move_num} — move={move}, legal={board.get_legal_moves()}")
+            return None, move_num
         board.make_move(*move)
 
-    return board.check_win()
+    return board.check_win(), len(board.move_history)
 
 
 def run_evaluation(
@@ -341,10 +358,13 @@ def run_evaluation(
     best_wrapper = GomokuInferenceWrapper(Path(best_checkpoint), device=device or "cpu")
 
     for i in range(num_games):
+        t_start = time.monotonic()
         if i % 2 == 0:
-            winner = _play_eval_game(new_wrapper, best_wrapper, num_simulations=num_simulations)
+            winner, moves = _play_eval_game(new_wrapper, best_wrapper, num_simulations=num_simulations)
         else:
-            winner = _play_eval_game(best_wrapper, new_wrapper, num_simulations=num_simulations)
+            winner, moves = _play_eval_game(best_wrapper, new_wrapper, num_simulations=num_simulations)
+        elapsed = time.monotonic() - t_start
+        print(f"  eval game {i+1}/{num_games} complete: winner={winner}, moves={moves}, {elapsed:.1f}s")
 
         if i % 2 == 0 and winner == Player.BLACK:
             new_wins += 1
@@ -372,6 +392,7 @@ def main(
     max_grad_norm: float = 5.0,
     resignation_warmup_iters: int = 10,
     seed: Optional[int] = None,
+    fresh_start: bool = False,
 ) -> None:
     """Run the AlphaZero training loop.
 
@@ -403,6 +424,12 @@ def main(
     buffer_path = data_dir / "replay_buffer.pt"
     state_path = data_dir / "training_state.pt"
     csv_path = data_dir / "training_log.csv"
+    elo_path = data_dir / "elo_state.json"
+
+    if fresh_start:
+        for _p in [state_path, buffer_path, elo_path, csv_path]:
+            _p.unlink(missing_ok=True)
+        print("fresh_start=True — cleared persisted training state")
 
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -442,7 +469,6 @@ def main(
     # ------------------------------------------------------------------
     # Elo tracking — persist across training sessions.
     # ------------------------------------------------------------------
-    elo_path = data_dir / "elo_state.json"
     elo_tracker = EloTracker()
     if elo_path.exists():
         elo_tracker.load(elo_path)
@@ -462,6 +488,14 @@ def main(
         model.to(device)
         save_model_checkpoint(model, latest_path)
         print(f"Resumed at iteration {start_iteration}")
+
+        if start_iteration > num_iterations:
+            print(
+                f"WARNING: resumed iteration ({start_iteration}) exceeds "
+                f"num_iterations ({num_iterations}). Nothing to train. "
+                f"Use --fresh or increase --iterations."
+            )
+            return
 
     # ------------------------------------------------------------------
     # CSV logging — create the log file if it does not exist.
@@ -494,7 +528,11 @@ def main(
 
         for game_i in range(games_per_iteration):
             t_game = time.monotonic()
-            examples = game_runner.play()
+            try:
+                examples = game_runner.play()
+            except ZeroDivisionError:
+                print(f"  Game {game_i + 1}/{games_per_iteration} skipped (insufficient simulations)")
+                continue
             t_game = time.monotonic() - t_game
             print(f"  Game {game_i + 1}/{games_per_iteration} done in {t_game:.1f}s, "
                   f"{len(examples)} examples")
@@ -651,6 +689,8 @@ if __name__ == "__main__":
                         help="Deterministic RNG seed (None = non-deterministic)")
     parser.add_argument("--resignation-warmup-iters", type=int, default=10,
                         help="Iterations before resignation heuristic activates")
+    parser.add_argument("--fresh", action="store_true", default=False,
+                        help="Clear persisted state and start a new training run from scratch.")
 
     args = parser.parse_args()
 
@@ -681,4 +721,5 @@ if __name__ == "__main__":
         max_grad_norm=args.max_grad_norm,
         seed=args.seed,
         resignation_warmup_iters=args.resignation_warmup_iters,
+        fresh_start=args.fresh,
     )
