@@ -44,10 +44,30 @@ def compute_loss(
 
 
 def save_model_checkpoint(model: GomokuNet, path: str | Path) -> None:
-    """Save model state_dict for InferenceWrapper compatibility."""
+    """Save model state_dict and architecture config for wrapper compatibility.
+
+    Checkpoint format::
+
+        {
+            "state_dict": OrderedDict[str, Tensor],
+            "arch_config": dict[str, object]:
+                board_size, num_res_blocks, num_hidden_channels, use_se,
+                use_attention, use_pre_activation, se_reduction,
+                num_attention_heads, use_spatial, policy_hidden_channels,
+                drop_path_rate, in_channels
+        }
+
+    The arch_config enables ``GomokuInferenceWrapper`` to reconstruct the
+    exact model architecture without the caller supplying constructor
+    arguments that may not match.
+    """
     path = Path(path)
     tmp = path.with_suffix(".tmp")
-    torch.save(model.state_dict(), str(tmp))
+    data = {
+        "state_dict": model.state_dict(),
+        "arch_config": model.get_arch_config(),
+    }
+    torch.save(data, str(tmp))
     tmp.rename(path)
 
 
@@ -385,9 +405,13 @@ def main(
         # --- Phase B: Train ---
         # Reload latest weights into the persistent model so optimizer
         # retains momentum across checkpoint versions.
-        state_dict = torch.load(
+        checkpoint = torch.load(
             str(latest_path), map_location=device, weights_only=True
         )
+        if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+            state_dict = checkpoint["state_dict"]
+        else:
+            state_dict = checkpoint
         model.load_state_dict(state_dict)
 
         metrics = train_on_examples(

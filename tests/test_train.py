@@ -93,14 +93,20 @@ def test_compute_loss_value_wrong():
 
 
 def test_save_model_checkpoint_roundtrip():
+    """Save → load round-trip produces identical outputs (new format)."""
     model = GomokuNet()
     with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
         tmp = Path(f.name)
 
     try:
         save_model_checkpoint(model, tmp)
+        data = torch.load(str(tmp), map_location="cpu", weights_only=False)
+        assert isinstance(data, dict)
+        assert "state_dict" in data
+        assert "arch_config" in data
+        assert data["arch_config"]["num_res_blocks"] == 10
         loaded = GomokuNet()
-        loaded.load_state_dict(torch.load(str(tmp), map_location="cpu", weights_only=True))
+        loaded.load_state_dict(data["state_dict"])
         model.eval()
         loaded.eval()
 
@@ -210,3 +216,36 @@ def test_main_one_iteration_no_crash():
             assert Path("checkpoints/latest.pt").exists()
         finally:
             os.chdir(orig_cwd)
+
+
+def test_save_model_checkpoint_nondefault_arch_roundtrip():
+    """Non-default architecture checkpoint saves and restores correctly."""
+    model = GomokuNet(
+        num_res_blocks=5,
+        num_hidden_channels=64,
+        use_se=False,
+        use_attention=False,
+    )
+    with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
+        tmp = Path(f.name)
+
+    try:
+        save_model_checkpoint(model, tmp)
+        data = torch.load(str(tmp), map_location="cpu", weights_only=False)
+        assert data["arch_config"]["num_res_blocks"] == 5
+        assert data["arch_config"]["num_hidden_channels"] == 64
+        assert data["arch_config"]["use_se"] is False
+        assert data["arch_config"]["use_attention"] is False
+        loaded = GomokuNet.from_config(data["arch_config"])
+        loaded.load_state_dict(data["state_dict"])
+        model.eval()
+        loaded.eval()
+
+        x = torch.randn(2, 3, 15, 15)
+        with torch.no_grad():
+            lp1, v1 = model(x)
+            lp2, v2 = loaded(x)
+        assert torch.allclose(lp1, lp2)
+        assert torch.allclose(v1, v2)
+    finally:
+        tmp.unlink()
