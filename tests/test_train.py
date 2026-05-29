@@ -101,6 +101,8 @@ def test_save_model_checkpoint_roundtrip():
         save_model_checkpoint(model, tmp)
         loaded = GomokuNet()
         loaded.load_state_dict(torch.load(str(tmp), map_location="cpu", weights_only=True))
+        model.eval()
+        loaded.eval()
 
         x = torch.randn(2, 3, 15, 15)
         with torch.no_grad():
@@ -175,7 +177,7 @@ def test_run_evaluation_smoke():
         save_model_checkpoint(model, tmp_new)
         save_model_checkpoint(model, tmp_best)
 
-        win_rate = run_evaluation(tmp_new, tmp_best, num_games=2, device="cpu")
+        win_rate = run_evaluation(tmp_new, tmp_best, num_games=2, device="cpu", num_simulations=10)
         assert isinstance(win_rate, float)
         assert 0.0 <= win_rate <= 1.0
     finally:

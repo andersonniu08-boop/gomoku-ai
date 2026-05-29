@@ -211,6 +211,7 @@ class SelfPlayGame:
         # Resignation tracking: consecutive moves where the root value
         # estimate is below the resignation threshold.
         consecutive_lost: int = 0
+        resigned = False
 
         while not board.is_terminal():
             move_num = len(board.move_history)
@@ -254,10 +255,13 @@ class SelfPlayGame:
                 else:
                     consecutive_lost = 0
                 if consecutive_lost >= self.resignation_moves:
+                    resigned = True
                     break
 
         # Phase 2 — convert to (state, policy, value_target)
         winner = board.check_win()
+        if not winner and resigned:
+            winner = board.current_player
         examples = _assign_values(raw, winner)
 
         # Phase 3 — optional symmetry augmentation

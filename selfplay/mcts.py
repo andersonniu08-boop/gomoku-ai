@@ -116,7 +116,7 @@ class MCTS:
         c_puct: float = 2.5,
         num_simulations: int = 800,
         time_budget_ms: float | None = None,
-        batch_size: int = 1,
+        batch_size: int = 8,
         threat_override: bool = True,
         dirichlet_alpha: float | None = None,
         dirichlet_epsilon: float = 0.25,

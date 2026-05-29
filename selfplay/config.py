@@ -29,7 +29,7 @@ class StrengthConfig:
 
     num_simulations: int = 800
     c_puct: float = 2.5
-    batch_size: int = 1
+    batch_size: int = 8
     threat_override: bool = True
     time_budget_ms: float | None = None
     description: str = ""

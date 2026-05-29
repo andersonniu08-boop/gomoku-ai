@@ -425,8 +425,7 @@ def test_selfplay_no_double_search():
             game = SelfPlayGame(
                 wrapper,
                 num_simulations=10,
-                temperature=1.0,
-                temperature_threshold=0,
+                temperature_stages=[(0, 1.0), (1, 0.0)],
                 opening_moves=0,
                 augment=False,
             )

@@ -45,7 +45,10 @@ def compute_loss(
 
 def save_model_checkpoint(model: GomokuNet, path: str | Path) -> None:
     """Save model state_dict for InferenceWrapper compatibility."""
-    torch.save(model.state_dict(), str(path))
+    path = Path(path)
+    tmp = path.with_suffix(".tmp")
+    torch.save(model.state_dict(), str(tmp))
+    tmp.rename(path)
 
 
 def ingest_game_files(
@@ -196,7 +199,7 @@ def train_on_examples(
 def _play_eval_game(
     black_wrapper: GomokuInferenceWrapper,
     white_wrapper: GomokuInferenceWrapper,
-    num_simulations: int = 800,
+    num_simulations: int = 200,
 ) -> Player | None:
     """Play one deterministic game between two different models.
 
@@ -223,6 +226,7 @@ def run_evaluation(
     best_checkpoint: str | Path,
     num_games: int = 100,
     device: Optional[str] = None,
+    num_simulations: int = 200,
 ) -> float:
     """Pit new model vs best model and return new model's win rate.
 
@@ -236,9 +240,9 @@ def run_evaluation(
 
     for i in range(num_games):
         if i % 2 == 0:
-            winner = _play_eval_game(new_wrapper, best_wrapper)
+            winner = _play_eval_game(new_wrapper, best_wrapper, num_simulations=num_simulations)
         else:
-            winner = _play_eval_game(best_wrapper, new_wrapper)
+            winner = _play_eval_game(best_wrapper, new_wrapper, num_simulations=num_simulations)
 
         if i % 2 == 0 and winner == Player.BLACK:
             new_wins += 1
@@ -260,6 +264,7 @@ def main(
     eval_games: int = 100,
     eval_threshold: float = 0.55,
     mcts_simulations: int = 800,
+    eval_simulations: int = 200,
     sim_schedule: list[tuple[int, int]] | None = None,
     device: Optional[str] = None,
     game_examples_dir: str | Path = "game_examples/",
@@ -407,7 +412,8 @@ def main(
         if iteration % eval_frequency == 0:
             print(f"  Evaluating latest vs best ({eval_games} games)...")
             win_rate = run_evaluation(
-                latest_path, best_path, num_games=eval_games, device=device
+                latest_path, best_path, num_games=eval_games, device=device,
+                num_simulations=eval_simulations,
             )
 
             # Record Elo update from the evaluation match.

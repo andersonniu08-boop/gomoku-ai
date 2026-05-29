@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 import torch
 
@@ -11,6 +12,24 @@ from engine.board import Board, Player
 from engine.encoding import board_to_tensor, policy_to_move_probs
 from engine.threats import ThreatDetector, ThreatType
 from neural.model import GomokuNet
+
+
+class _NoopProfiler:
+    """Profiler stub with the same API as selfplay.profiler.Profiler.
+
+    Used when no profiler is passed to GomokuInferenceWrapper, avoiding a
+    circular dependency between neural/ and selfplay/.
+    """
+
+    def enable(self) -> None:
+        pass
+
+    def disable(self) -> None:
+        pass
+
+    @contextmanager
+    def measure(self, name: str) -> Iterator[None]:
+        yield
 
 
 class GomokuInferenceWrapper:
@@ -27,7 +46,7 @@ class GomokuInferenceWrapper:
         use_se: bool = True,
         use_attention: bool = True,
         use_pre_activation: bool = False,
-        profiler: Optional[Profiler] = None,
+        profiler: Optional[object] = None,
     ):
         if device is None:
             if torch.cuda.is_available():
@@ -37,8 +56,7 @@ class GomokuInferenceWrapper:
             else:
                 device = "cpu"
         self.device = torch.device(device)
-        from selfplay.profiler import Profiler as _Profiler
-        self.profiler: _Profiler = profiler or _Profiler()
+        self.profiler = profiler or _NoopProfiler()
         self.profiler.disable()  # off by default; MCTS enables when needed
 
         self.model = GomokuNet(
