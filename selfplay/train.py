@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import csv
 import os
 import random
@@ -616,4 +617,68 @@ def main(
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(
+        description="AlphaZero training loop for Gomoku AI",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--num-iterations", type=int, default=50,
+                        help="Number of training iterations")
+    parser.add_argument("--games-per-iteration", type=int, default=10,
+                        help="Local self-play games generated per iteration")
+    parser.add_argument("--batch-size", type=int, default=256,
+                        help="Training mini-batch size")
+    parser.add_argument("--learning-rate", type=float, default=0.001,
+                        help="Adam initial learning rate")
+    parser.add_argument("--eval-frequency", type=int, default=5,
+                        help="Iterations between model evaluations")
+    parser.add_argument("--eval-games", type=int, default=100,
+                        help="Number of games per evaluation")
+    parser.add_argument("--eval-threshold", type=float, default=0.55,
+                        help="Win-rate threshold to promote latest → best")
+    parser.add_argument("--mcts-simulations", type=int, default=800,
+                        help="MCTS simulations per move during self-play")
+    parser.add_argument("--eval-simulations", type=int, default=200,
+                        help="MCTS simulations per move during evaluation")
+    parser.add_argument("--sim-schedule", type=str, default=None,
+                        help="Comma-separated iter:sims pairs (e.g. '10:400,20:800')")
+    parser.add_argument("--device", type=str, default=None,
+                        help="Torch device (cuda, cpu, mps). Default: auto-detect.")
+    parser.add_argument("--game-examples-dir", type=str, default="game_examples/",
+                        help="Directory for worker-produced game files")
+    parser.add_argument("--max-grad-norm", type=float, default=5.0,
+                        help="Max gradient norm for clipping")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Deterministic RNG seed (None = non-deterministic)")
+    parser.add_argument("--resignation-warmup-iters", type=int, default=10,
+                        help="Iterations before resignation heuristic activates")
+
+    args = parser.parse_args()
+
+    sim_schedule = None
+    if args.sim_schedule is not None:
+        sim_schedule = []
+        for item in args.sim_schedule.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            iter_str, sims_str = item.split(":")
+            sim_schedule.append((int(iter_str), int(sims_str)))
+        sim_schedule.sort()
+
+    main(
+        num_iterations=args.num_iterations,
+        games_per_iteration=args.games_per_iteration,
+        batch_size=args.batch_size,
+        learning_rate=args.learning_rate,
+        eval_frequency=args.eval_frequency,
+        eval_games=args.eval_games,
+        eval_threshold=args.eval_threshold,
+        mcts_simulations=args.mcts_simulations,
+        eval_simulations=args.eval_simulations,
+        sim_schedule=sim_schedule,
+        device=args.device,
+        game_examples_dir=args.game_examples_dir,
+        max_grad_norm=args.max_grad_norm,
+        seed=args.seed,
+        resignation_warmup_iters=args.resignation_warmup_iters,
+    )
