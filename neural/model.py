@@ -396,6 +396,22 @@ class GomokuNet(nn.Module):
     ):
         super().__init__()
         self.board_size = board_size
+
+        self._arch_config = {
+            "board_size": board_size,
+            "in_channels": in_channels,
+            "num_res_blocks": num_res_blocks,
+            "num_hidden_channels": num_hidden_channels,
+            "use_se": use_se,
+            "use_attention": use_attention,
+            "use_pre_activation": use_pre_activation,
+            "se_reduction": se_reduction,
+            "num_attention_heads": num_attention_heads,
+            "use_spatial": use_spatial,
+            "policy_hidden_channels": policy_hidden_channels,
+            "drop_path_rate": drop_path_rate,
+        }
+
         action_space = board_size * board_size  # 225
 
         # --- dilation schedule ---
@@ -461,6 +477,22 @@ class GomokuNet(nn.Module):
         # 2C pooled descriptor to a scalar.
         self.value_fc1 = nn.Linear(num_hidden_channels * 2, 64)
         self.value_fc2 = nn.Linear(64, 1)
+
+    def get_arch_config(self) -> dict:
+        """Return architecture configuration dict for checkpoint persistence."""
+        return dict(self._arch_config)
+
+    @classmethod
+    def from_config(cls, config: dict) -> GomokuNet:
+        """Construct a GomokuNet from an architecture configuration dict.
+
+        Args:
+            config: dict with keys matching ``GomokuNet.__init__`` args.
+
+        Returns:
+            A new ``GomokuNet`` instance with the specified architecture.
+        """
+        return cls(**config)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         x = F.relu(self.bn_init(self.conv_init(x)))

@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 
 from engine.board import Board
+from engine.encoding import board_to_tensor, policy_to_move_probs
 from neural.model import (
     AttentionAugmentedConv,
     DropPath,
@@ -18,6 +19,7 @@ from neural.model import (
     SEResidualBlock,
 )
 from neural.wrapper import GomokuInferenceWrapper
+from selfplay.train import save_model_checkpoint
 
 
 # ---------------------------------------------------------------------------
@@ -617,3 +619,265 @@ def test_new_model_parameter_count():
     model = GomokuNet()
     total = sum(p.numel() for p in model.parameters())
     assert 3_000_000 < total < 4_000_000
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint architecture persistence
+# ---------------------------------------------------------------------------
+
+
+def test_get_arch_config_matches_constructor():
+    """get_arch_config() returns values matching constructor args."""
+    model = GomokuNet(
+        board_size=15,
+        in_channels=3,
+        num_res_blocks=7,
+        num_hidden_channels=96,
+        use_se=False,
+        use_attention=True,
+        use_pre_activation=True,
+        se_reduction=16,
+        num_attention_heads=2,
+        use_spatial=False,
+        policy_hidden_channels=48,
+        drop_path_rate=0.05,
+    )
+    config = model.get_arch_config()
+    assert config["board_size"] == 15
+    assert config["in_channels"] == 3
+    assert config["num_res_blocks"] == 7
+    assert config["num_hidden_channels"] == 96
+    assert config["use_se"] is False
+    assert config["use_attention"] is True
+    assert config["use_pre_activation"] is True
+    assert config["se_reduction"] == 16
+    assert config["num_attention_heads"] == 2
+    assert config["use_spatial"] is False
+    assert config["policy_hidden_channels"] == 48
+    assert config["drop_path_rate"] == 0.05
+    # Verify config is a copy, not the internal dict
+    assert config is not model._arch_config
+
+
+def test_get_arch_config_defaults():
+    """Default model config matches documented defaults."""
+    model = GomokuNet()
+    config = model.get_arch_config()
+    assert config["board_size"] == 15
+    assert config["in_channels"] == 3
+    assert config["num_res_blocks"] == 10
+    assert config["num_hidden_channels"] == 128
+    assert config["use_se"] is True
+    assert config["use_attention"] is True
+    assert config["use_pre_activation"] is False
+    assert config["se_reduction"] == 8
+    assert config["num_attention_heads"] == 4
+    assert config["policy_hidden_channels"] == 32
+    assert config["drop_path_rate"] == 0.1
+
+
+def test_from_config_creates_identical_model():
+    """from_config reconstructs a model with the same architecture."""
+    original = GomokuNet(
+        num_res_blocks=5,
+        num_hidden_channels=64,
+        use_se=False,
+        use_attention=False,
+    )
+    config = original.get_arch_config()
+    reconstructed = GomokuNet.from_config(config)
+    rconfig = reconstructed.get_arch_config()
+    assert config == rconfig
+    # Both models should produce the same output shapes
+    x = torch.randn(2, 3, 15, 15)
+    with torch.no_grad():
+        o_lp, o_v = original(x)
+        r_lp, r_v = reconstructed(x)
+    assert o_lp.shape == r_lp.shape == (2, 225)
+    assert o_v.shape == r_v.shape == (2, 1)
+
+
+def test_new_checkpoint_format_roundtrip_default_arch():
+    """Default-architecture model saved with save_model_checkpoint
+    loads correctly via wrapper without any arch kwargs."""
+    model = GomokuNet()
+    with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
+        tmp = Path(f.name)
+
+    try:
+        save_model_checkpoint(model, tmp)
+        # Load without providing any architecture kwargs — wrapper
+        # should auto-detect from the checkpoint.
+        wrapper = GomokuInferenceWrapper(tmp, device="cpu")
+        board = Board()
+        board.make_move(7, 7)
+        board.make_move(8, 8)
+        move_probs, value = wrapper.evaluate(board)
+        assert len(move_probs) > 0
+        assert abs(sum(p for _, p in move_probs) - 1.0) < 1e-5
+        assert -1.0 <= value <= 1.0
+    finally:
+        tmp.unlink()
+
+
+def test_new_checkpoint_format_roundtrip_nondefault_arch():
+    """Non-default architecture model saved with save_model_checkpoint
+    loads correctly via wrapper without any arch kwargs."""
+    model = GomokuNet(
+        num_res_blocks=5,
+        num_hidden_channels=64,
+        use_se=False,
+        use_attention=False,
+    )
+    with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
+        tmp = Path(f.name)
+
+    try:
+        save_model_checkpoint(model, tmp)
+        wrapper = GomokuInferenceWrapper(tmp, device="cpu")
+        # Verify the reconstructed model has the correct architecture
+        assert wrapper.model.board_size == 15
+        assert len(wrapper.model.res_blocks) == 5
+        assert wrapper.model.conv_init.out_channels == 64
+        board = Board()
+        board.make_move(7, 7)
+        board.make_move(8, 8)
+        move_probs, value = wrapper.evaluate(board)
+        assert len(move_probs) > 0
+        assert abs(sum(p for _, p in move_probs) - 1.0) < 1e-5
+        assert -1.0 <= value <= 1.0
+    finally:
+        tmp.unlink()
+
+
+def test_new_checkpoint_format_roundtrip_pre_activation():
+    """Pre-activation architecture round-trips correctly."""
+    model = GomokuNet(
+        num_res_blocks=5,
+        num_hidden_channels=64,
+        use_se=False,
+        use_attention=False,
+        use_pre_activation=True,
+    )
+    with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
+        tmp = Path(f.name)
+
+    try:
+        save_model_checkpoint(model, tmp)
+        wrapper = GomokuInferenceWrapper(tmp, device="cpu")
+        assert len(wrapper.model.res_blocks) == 5
+        move_probs, value = wrapper.evaluate(Board())
+        assert len(move_probs) > 0
+        assert -1.0 <= value <= 1.0
+    finally:
+        tmp.unlink()
+
+
+def test_legacy_checkpoint_loads_with_arch_kwargs():
+    """Legacy raw state_dict checkpoint loads correctly when caller
+    provides matching architecture kwargs."""
+    model = GomokuNet(num_res_blocks=5, num_hidden_channels=64, use_se=False, use_attention=False)
+    with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
+        torch.save(model.state_dict(), f)
+        tmp = Path(f.name)
+
+    try:
+        wrapper = GomokuInferenceWrapper(
+            tmp,
+            device="cpu",
+            num_res_blocks=5,
+            num_hidden_channels=64,
+            use_se=False,
+            use_attention=False,
+        )
+        board = Board()
+        board.make_move(7, 7)
+        move_probs, value = wrapper.evaluate(board)
+        assert len(move_probs) > 0
+        assert -1.0 <= value <= 1.0
+    finally:
+        tmp.unlink()
+
+
+def test_legacy_checkpoint_loads_with_default_fallback():
+    """Legacy raw state_dict checkpoint loads with default fallback
+    architecture when no arch kwargs are provided."""
+    model = GomokuNet(num_res_blocks=10, num_hidden_channels=128)
+    with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
+        torch.save(model.state_dict(), f)
+        tmp = Path(f.name)
+
+    try:
+        wrapper = GomokuInferenceWrapper(tmp, device="cpu")
+        # Default fallback reconstructs 10 blocks / 128 channels
+        assert len(wrapper.model.res_blocks) == 10
+        assert wrapper.model.conv_init.out_channels == 128
+        board = Board()
+        board.make_move(7, 7)
+        move_probs, value = wrapper.evaluate(board)
+        assert len(move_probs) > 0
+        assert -1.0 <= value <= 1.0
+    finally:
+        tmp.unlink()
+
+
+def test_save_model_checkpoint_arch_config_integrity():
+    """Verify that saved checkpoints contain correct arch_config values."""
+    model = GomokuNet(
+        num_res_blocks=6,
+        num_hidden_channels=72,
+        use_se=True,
+        use_attention=False,
+        use_pre_activation=True,
+    )
+    with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
+        tmp = Path(f.name)
+
+    try:
+        save_model_checkpoint(model, tmp)
+        data = torch.load(str(tmp), map_location="cpu", weights_only=False)
+        assert isinstance(data, dict)
+        assert "state_dict" in data
+        assert "arch_config" in data
+        arch = data["arch_config"]
+        assert arch["num_res_blocks"] == 6
+        assert arch["num_hidden_channels"] == 72
+        assert arch["use_se"] is True
+        assert arch["use_attention"] is False
+        assert arch["use_pre_activation"] is True
+        assert arch["board_size"] == 15
+        assert arch["in_channels"] == 3
+    finally:
+        tmp.unlink()
+
+
+def test_wrapper_output_matches_direct_model_new_format():
+    """Wrapper loaded from new-format checkpoint produces same outputs
+    as the original model."""
+    model = GomokuNet(num_res_blocks=5, num_hidden_channels=64, use_se=False, use_attention=False)
+    model.eval()
+    with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
+        tmp = Path(f.name)
+
+    try:
+        save_model_checkpoint(model, tmp)
+        wrapper = GomokuInferenceWrapper(tmp, device="cpu")
+        wrapper.model.eval()
+        board = Board()
+        board.make_move(7, 7)
+        board.make_move(8, 8)
+
+        wrapper_probs, wrapper_value = wrapper.evaluate(board)
+
+        tensor = board_to_tensor(board)
+        with torch.no_grad():
+            log_policy, value = model(tensor)
+        direct_probs = policy_to_move_probs(log_policy, board)
+        direct_value = float(value.item())
+
+        assert abs(wrapper_value - direct_value) < 1e-5
+        for (wm, wp), (dm, dp) in zip(sorted(wrapper_probs), sorted(direct_probs)):
+            assert wm == dm
+            assert abs(wp - dp) < 1e-5
+    finally:
+        tmp.unlink()

@@ -37,15 +37,23 @@ class GomokuInferenceWrapper:
     ``evaluate(board)`` method that returns policy priors and a value
     estimate for MCTS consumption."""
 
+    _ARCH_FALLBACK = {
+        "num_res_blocks": 10,
+        "num_hidden_channels": 128,
+        "use_se": True,
+        "use_attention": True,
+        "use_pre_activation": False,
+    }
+
     def __init__(
         self,
         checkpoint_path: str | Path,
         device: Optional[str] = None,
-        num_res_blocks: int = 10,
-        num_hidden_channels: int = 128,
-        use_se: bool = True,
-        use_attention: bool = True,
-        use_pre_activation: bool = False,
+        num_res_blocks: Optional[int] = None,
+        num_hidden_channels: Optional[int] = None,
+        use_se: Optional[bool] = None,
+        use_attention: Optional[bool] = None,
+        use_pre_activation: Optional[bool] = None,
         profiler: Optional[object] = None,
     ):
         if device is None:
@@ -59,20 +67,44 @@ class GomokuInferenceWrapper:
         self.profiler = profiler or _NoopProfiler()
         self.profiler.disable()  # off by default; MCTS enables when needed
 
+        raw = torch.load(
+            str(checkpoint_path), map_location=self.device, weights_only=False
+        )
+
+        if isinstance(raw, dict) and "arch_config" in raw:
+            arch = raw["arch_config"]
+            self._arch_source = "checkpoint"
+        else:
+            arch = {}
+            self._arch_source = "fallback_defaults"
+
         self.model = GomokuNet(
-            board_size=15,
-            in_channels=3,
-            num_res_blocks=num_res_blocks,
-            num_hidden_channels=num_hidden_channels,
-            use_se=use_se,
-            use_attention=use_attention,
-            use_pre_activation=use_pre_activation,
+            board_size=arch.get("board_size", 15),
+            in_channels=arch.get("in_channels", 3),
+            num_res_blocks=(
+                num_res_blocks if num_res_blocks is not None
+                else arch.get("num_res_blocks", self._ARCH_FALLBACK["num_res_blocks"])
+            ),
+            num_hidden_channels=(
+                num_hidden_channels if num_hidden_channels is not None
+                else arch.get("num_hidden_channels", self._ARCH_FALLBACK["num_hidden_channels"])
+            ),
+            use_se=(
+                use_se if use_se is not None
+                else arch.get("use_se", self._ARCH_FALLBACK["use_se"])
+            ),
+            use_attention=(
+                use_attention if use_attention is not None
+                else arch.get("use_attention", self._ARCH_FALLBACK["use_attention"])
+            ),
+            use_pre_activation=(
+                use_pre_activation if use_pre_activation is not None
+                else arch.get("use_pre_activation", self._ARCH_FALLBACK["use_pre_activation"])
+            ),
         ).to(self.device)
 
-        checkpoint = torch.load(
-            str(checkpoint_path), map_location=self.device, weights_only=True
-        )
-        self.model.load_state_dict(checkpoint)
+        state_dict = raw if not (isinstance(raw, dict) and "state_dict" in raw) else raw["state_dict"]
+        self.model.load_state_dict(state_dict)
         self.model.eval()
 
         # Enable TF32 tensor cores for ~2× matmul throughput on Ampere+.
