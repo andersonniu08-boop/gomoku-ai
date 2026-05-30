@@ -3,47 +3,64 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Gomoku AI</title>
+  <title>NeuralGomoku</title>
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
   <div id="app">
     <header>
-      <h1>Gomoku AI</h1>
+      <h1>NeuralGomoku</h1>
     </header>
 
     <main>
       <div id="board-container">
         <canvas id="board-canvas" width="480" height="480"></canvas>
+
+        <div id="controls-bar">
+          <div class="control-group">
+            <button id="btn-side-black" class="btn active" title="Play as Black (first move)">Black</button>
+            <button id="btn-side-white" class="btn" title="Play as White (AI moves first)">White</button>
+          </div>
+
+          <span class="control-divider"></span>
+
+          <div class="control-group">
+            <button id="btn-strength-fast" class="btn" title="200 simulations per move — quick casual play">Fast</button>
+            <button id="btn-strength-medium" class="btn active" title="800 simulations per move — balanced strength and speed">Medium</button>
+            <button id="btn-strength-strong" class="btn" title="2000 simulations per move — strongest tactical play">Strong</button>
+          </div>
+
+          <span class="control-divider"></span>
+
+          <div class="control-group">
+            <button id="toggle-heatmap" class="btn active" title="Neural-network-guided search heatmap. Brighter cells = higher visit counts = moves the AI considers strongest.">Heatmap</button>
+            <button id="toggle-tree" class="btn active" title="MCTS search tree visualization. Shows top moves ranked by simulation visit count during the AI's search.">Tree</button>
+          </div>
+
+          <span class="control-divider"></span>
+
+          <button id="btn-new-game" class="btn-new">New Game</button>
+        </div>
+
         <div id="status-bar">
           <span id="status-player"></span>
-          <div id="toggle-bar">
-            <button id="btn-side-black" class="toggle active">● Black</button>
-            <button id="btn-side-white" class="toggle">○ White</button>
-            <span class="sep"></span>
-            <button id="btn-strength-fast" class="toggle strength">Fast</button>
-            <button id="btn-strength-medium" class="toggle strength active">Med</button>
-            <button id="btn-strength-strong" class="toggle strength">Strong</button>
-            <span class="sep"></span>
-            <button id="toggle-heatmap" class="toggle active">■ Heatmap</button>
-            <button id="toggle-tree" class="toggle active">◨ Tree</button>
-            <button id="btn-new-game">New Game</button>
-          </div>
           <span id="status-info"></span>
         </div>
+
+        <div id="info-bar"></div>
       </div>
 
       <aside id="search-panel" class="visible">
         <div id="panel-header">
           <span>Search Tree</span>
-          <button id="panel-close">✕</button>
+          <button id="panel-close">&times;</button>
         </div>
         <div id="panel-subtitle"></div>
         <div id="panel-list"></div>
       </aside>
     </main>
 
-    <div id="thinking" class="hidden">thinking...</div>
+    <div id="thinking" class="hidden">Thinking&hellip;</div>
   </div>
 
   <script src="/app.js"></script>

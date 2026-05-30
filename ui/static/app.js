@@ -1,5 +1,5 @@
 // ──────────────────────────────────────────────────────────────
-//  Gomoku AI — Canvas Board Renderer & Game Client
+//  NeuralGomoku — Canvas Board Renderer & Game Client
 // ──────────────────────────────────────────────────────────────
 
 const BOARD_SIZE = 15;
@@ -14,6 +14,7 @@ const ctx = canvas.getContext('2d');
 // DOM refs
 const statusPlayer = document.getElementById('status-player');
 const statusInfo = document.getElementById('status-info');
+const infoBar = document.getElementById('info-bar');
 const thinkingEl = document.getElementById('thinking');
 const searchPanel = document.getElementById('search-panel');
 const panelList = document.getElementById('panel-list');
@@ -59,13 +60,28 @@ function drawBoard(state) {
   const grid = state.board;
   ctx.clearRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
 
-  // Wood background
-  ctx.fillStyle = '#DEB361';
+  // Wood background with gradient
+  const woodGrad = ctx.createLinearGradient(0, 0, CANVAS_SIZE, CANVAS_SIZE);
+  woodGrad.addColorStop(0, '#c8a45c');
+  woodGrad.addColorStop(0.3, '#d4b06a');
+  woodGrad.addColorStop(0.6, '#c49a4a');
+  woodGrad.addColorStop(1, '#b8923e');
+  ctx.fillStyle = woodGrad;
   ctx.fillRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
 
+  // Subtle wood grain lines
+  ctx.strokeStyle = 'rgba(0,0,0,0.04)';
+  ctx.lineWidth = 0.5;
+  for (let gy = 0; gy < CANVAS_SIZE; gy += 7) {
+    ctx.beginPath();
+    ctx.moveTo(0, gy);
+    ctx.lineTo(CANVAS_SIZE, gy);
+    ctx.stroke();
+  }
+
   // Grid lines
-  ctx.strokeStyle = '#333';
-  ctx.lineWidth = 0.8;
+  ctx.strokeStyle = '#4a3a28';
+  ctx.lineWidth = 0.6;
   for (let i = 0; i < BOARD_SIZE; i++) {
     const p = PADDING + i * CELL;
     ctx.beginPath();
@@ -78,8 +94,13 @@ function drawBoard(state) {
     ctx.stroke();
   }
 
+  // Outer border
+  ctx.strokeStyle = '#3a2a18';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(PADDING, PADDING, CANVAS_SIZE - 2 * PADDING, CANVAS_SIZE - 2 * PADDING);
+
   // Star points
-  ctx.fillStyle = '#333';
+  ctx.fillStyle = '#3a2a18';
   for (const [r, c] of STAR_POINTS) {
     const { x, y } = gridToPixel(r, c);
     ctx.beginPath();
@@ -113,20 +134,29 @@ function drawBoard(state) {
 
 function drawStone(row, col, isBlack) {
   const { x, y } = gridToPixel(row, col);
-  const grad = ctx.createRadialGradient(x - 3, y - 3, 1, x, y, STONE_RADIUS);
+
+  // Stone shadow
+  ctx.beginPath();
+  ctx.arc(x + 1, y + 1, STONE_RADIUS, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(0,0,0,0.25)';
+  ctx.fill();
+
+  const grad = ctx.createRadialGradient(x - 2.5, y - 2.5, 1, x, y, STONE_RADIUS);
   if (isBlack) {
-    grad.addColorStop(0, '#555');
-    grad.addColorStop(1, '#111');
+    grad.addColorStop(0, '#666');
+    grad.addColorStop(0.6, '#1a1a1a');
+    grad.addColorStop(1, '#0a0a0a');
   } else {
     grad.addColorStop(0, '#fff');
-    grad.addColorStop(1, '#ccc');
+    grad.addColorStop(0.5, '#f0f0f0');
+    grad.addColorStop(1, '#c0c0c0');
   }
   ctx.beginPath();
   ctx.arc(x, y, STONE_RADIUS, 0, Math.PI * 2);
   ctx.fillStyle = grad;
   ctx.fill();
-  ctx.strokeStyle = isBlack ? '#000' : '#aaa';
-  ctx.lineWidth = 0.5;
+  ctx.strokeStyle = isBlack ? '#000' : '#999';
+  ctx.lineWidth = 0.4;
   ctx.stroke();
 }
 
@@ -140,11 +170,12 @@ function drawHeatmap(visitCounts, grid) {
 
     const { x, y } = gridToPixel(r, c);
     const intensity = Math.min(count / maxVisits, 1);
-    const red = Math.floor(255 * (1 - intensity));
-    const green = Math.floor(200 * intensity);
+    const alpha = 0.15 + intensity * 0.3;
+    const blue = Math.floor(88 + 70 * intensity);
+    const green = Math.floor(166 - 50 * intensity);
     ctx.beginPath();
     ctx.arc(x, y, STONE_RADIUS, 0, Math.PI * 2);
-    ctx.fillStyle = `rgba(${red}, ${green}, 0, 0.35)`;
+    ctx.fillStyle = `rgba(${88 - 30 * intensity}, ${green}, ${blue}, ${alpha})`;
     ctx.fill();
   }
 }
@@ -296,13 +327,6 @@ function drawBoardWithHover(state) {
 
   const { x, y } = gridToPixel(r, c);
 
-  // Subtle highlight ring around hover cell
-  ctx.beginPath();
-  ctx.arc(x, y, STONE_RADIUS + 3, 0, Math.PI * 2);
-  ctx.strokeStyle = 'rgba(255, 255, 255, 0.8)';
-  ctx.lineWidth = 1.5;
-  ctx.stroke();
-
   // Ghost stone (translucent orb)
   const isBlack = state.current_player === 1;
   const grad = ctx.createRadialGradient(x - 3, y - 3, 1, x, y, STONE_RADIUS);
@@ -373,12 +397,14 @@ canvas.addEventListener('click', (e) => {
 document.getElementById('toggle-heatmap').addEventListener('click', () => {
   heatmapOn = !heatmapOn;
   document.getElementById('toggle-heatmap').classList.toggle('active');
+  updateInfoBar();
   if (state) drawBoardWithHover(state);
 });
 
 document.getElementById('toggle-tree').addEventListener('click', () => {
   treeOn = !treeOn;
   document.getElementById('toggle-tree').classList.toggle('active');
+  updateInfoBar();
   if (treeOn && state && state.search) {
     searchPanel.classList.add('visible');
   } else {
@@ -427,6 +453,20 @@ strengthStrongBtn.addEventListener('click', () => {
   }
 });
 
+// ─── Info bar ───
+
+function updateInfoBar() {
+  const parts = [];
+  if (heatmapOn) {
+    parts.push('Heatmap shows neural-network-guided search priorities — brighter cells indicate higher MCTS visit counts.');
+  }
+  if (treeOn) {
+    parts.push('Tree panel displays the MCTS search tree ranked by simulation visits during the AI\'s turn.');
+  }
+  infoBar.textContent = parts.join(' ');
+}
+
 // ─── Init ───
 
 startNewGame('black', 'medium');
+updateInfoBar();

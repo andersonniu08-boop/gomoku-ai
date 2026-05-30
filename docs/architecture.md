@@ -1,15 +1,15 @@
-# Gomoku AI — Architecture Document
+# NeuralGomoku — Architecture Document
 
 ## Project Overview
 
 Hybrid Gomoku (15×15, 5-in-a-row) engine combining Monte Carlo Tree Search with
 deep neural networks for position evaluation and policy guidance, following the
-AlphaZero paradigm. Built with PyTorch and NumPy.
+self-play reinforcement learning paradigm. Built with PyTorch and NumPy.
 
 ## Directory Structure
 
 ```
-gomoku-ai/
+neural-gomoku/
 │
 ├── engine/                         # Game logic layer (zero framework deps)
 │   ├── board.py                    #   Board, Player — state, moves, win detection
@@ -179,7 +179,7 @@ NumPy arrays) with no UI dependencies — ready for Phase 5 rendering.
 
 ## Data Flow
 
-### Training Loop (AlphaZero cycle)
+### Training Loop
 
 ```
 Iteration:

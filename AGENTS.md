@@ -1,4 +1,4 @@
-# Gomoku AI — AlphaZero-Style Engine
+# NeuralGomoku — ML Engine
 
 Hybrid Gomoku (15×15, 5-in-a-row) engine combining Monte Carlo Tree Search with
 deep neural networks for position evaluation and policy guidance. Built with
@@ -7,7 +7,7 @@ PyTorch and NumPy for research, education, and experimentation.
 ## Project Purpose
 
 This engine plays Gomoku at superhuman strength by fusing classical tree search
-with learned neural intuition, following the AlphaZero paradigm. It is designed
+with learned neural intuition. It is designed
 as a modular research platform where every component (board, search, network,
 training) can be studied, replaced, or extended independently.
 
@@ -18,9 +18,6 @@ training) can be studied, replaced, or extended independently.
 - The board engine is deterministic, UI-agnostic, and free of search logic.
 - MCTS operates through a clean interface that accepts any board and any
   inference backend — it knows nothing about PyTorch internals.
-- The neural network is a pure PyTorch module with no dependency on the game
-  rules or search code.
-- Self-play and training pipelines are isolated from frontend / API concerns.
 
 ## Core Architecture Rules
 
@@ -213,7 +210,7 @@ Checkpoint loading, device placement, board→tensor conversion, inference.
 Provides `evaluate()`, `batch_evaluate()`, `evaluate_with_threats()`.
 
 ### `selfplay/mcts.py`
-AlphaZero MCTS with PUCT. Key features:
+MCTS with PUCT. Key features:
 - Batched descent with virtual loss for GPU-efficient parallel leaf evaluation.
 - Tree reuse: re-roots previous search tree across consecutive moves.
 - Threat override short-circuit at root.
@@ -244,7 +241,7 @@ augmentation on retrieval (8× effective data at 1/8 memory). Persists via
 `state_dict()` / `from_state_dict()`.
 
 ### `selfplay/train.py`
-AlphaZero training loop:
+Training loop:
 1. Ingest worker-generated game files.
 2. Generate local self-play games with current model.
 3. Sample from replay buffer and train (cross-entropy policy + MSE value).
@@ -366,7 +363,7 @@ Flatten → LogSoftmax           FC(64→1) → Tanh
 
 ## Self-Play & Training
 
-### AlphaZero Loop
+### Training Loop
 
 1. **Self-play:** Current model plays games against itself via MCTS.
 2. **Data:** Each game produces (state, MCTS visit dist, outcome) triples.
