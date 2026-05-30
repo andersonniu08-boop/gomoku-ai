@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reporting tools for Gomoku AI evaluation."""
+"""Reporting tools for NeuralGomoku evaluation."""
 from __future__ import annotations
 import argparse, json, sys, time
 from pathlib import Path

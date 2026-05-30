@@ -1,4 +1,4 @@
-"""AlphaZero-style self-play game generator.
+"""Self-play game generator.
 
 Produces (state, policy_target, value_target) training triples by running
 MCTS-guided games where two copies of the same AI play each other.

@@ -210,7 +210,7 @@ class EvalRegistry:
         """Generate a comprehensive evaluation report."""
         parts = [
             "=" * 60,
-            "Gomoku AI — Evaluation Report",
+            "NeuralGomoku — Evaluation Report",
             f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}",
             "=" * 60,
             "",

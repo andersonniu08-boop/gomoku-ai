@@ -1,4 +1,4 @@
-"""Fixed-capacity replay buffer for AlphaZero self-play training examples.
+"""Fixed-capacity replay buffer for self-play training examples.
 
 Stores ``TrainingExample`` triples and provides random batching suitable
 for feeding a PyTorch ``DataLoader`` or a manual training loop.

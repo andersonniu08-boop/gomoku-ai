@@ -1,4 +1,4 @@
-"""AlphaZero-style MCTS with PUCT, driven by a dual-headed CNN."""
+"""MCTS with PUCT, driven by a dual-headed CNN."""
 
 from __future__ import annotations
 

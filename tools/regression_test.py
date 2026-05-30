@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression testing for Gomoku AI."""
+"""Regression testing for NeuralGomoku."""
 from __future__ import annotations
 import argparse, json, sys, tempfile, time
 from dataclasses import dataclass, field, asdict

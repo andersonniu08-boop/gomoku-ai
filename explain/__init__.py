@@ -1,4 +1,4 @@
-"""Explainability tools for Gomoku AI — saliency, activations, and comparison.
+"""Explainability tools for NeuralGomoku — saliency, activations, and comparison.
 
 Each subsystem is independently importable and testable.
 No explain/ module imports from another explain/ module.

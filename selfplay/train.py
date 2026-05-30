@@ -1,4 +1,4 @@
-"""AlphaZero training loop with self-play data generation and model evaluation."""
+"""Self-play training loop with data generation and model evaluation."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ def compute_loss(
     target_policy: torch.Tensor,
     target_value: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """AlphaZero training losses.
+    """Training losses.
 
     Args:
         log_policy: (B, 225) log-softmax output from network.
@@ -394,7 +394,7 @@ def main(
     seed: Optional[int] = None,
     fresh_start: bool = False,
 ) -> None:
-    """Run the AlphaZero training loop.
+    """Run the training loop.
 
     Two-phase iteration:
       1. Collect self-play data (from worker game files or local generation).
@@ -656,7 +656,7 @@ def main(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="AlphaZero training loop for Gomoku AI",
+        description="Self-play training loop for NeuralGomoku",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--num-iterations", type=int, default=50,
